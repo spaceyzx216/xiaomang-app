@@ -8,6 +8,7 @@ import { useAuth } from "./auth";
 import { PublishSelectionDrafts, type PublishSelectionPatch } from "./publishSelectionDraft";
 import { parseApiError } from "./reportApi";
 import { readCachedFinalDrafts } from "./finalDraftCache";
+import { buildPublishExport, compactTopicLabel, editorPayloadFromDraft, filterExportDrafts, hasDraftExportContent, pickDraftExportBlock, sameDraftTopic, withCurrentPublishSelection, type DraftExportBlock } from "./draftExport";
 import {
   ACCOUNT_TAG_ANGLES,
   analyzeBenchmarkCover,
@@ -337,7 +338,11 @@ export default function PublishWarehousePage() {
   }, []);
 
   const [activeTab, setActiveTab] = useState<TabId>("cover");
-  const [activeTopicIndex, setActiveTopicIndex] = useState(0);
+  const [activeTopicIndex, setActiveTopicIndex] = useState(() => {
+    const payload = loadJson<any>("finalDraftPayload", null);
+    const index = selectedTopics.findIndex(topic => sameDraftTopic(payload, topic));
+    return Math.max(0, index);
+  });
 
   // Old queues must not send pending writes with a different login's cookie.
   const saveScope = useRef({ userId, customerId, active: false });
@@ -429,7 +434,18 @@ export default function PublishWarehousePage() {
 
   // 导出 / 结束任务
   const [exporting, setExporting] = useState("");
-  const [bitableUrl, setBitableUrl] = useState("");
+  const bitableStorageKey = `xiaomang.feishuBitable.${String(activeTask?._id || activeTask?.customerName || "default").trim() || "default"}`;
+  const [bitableUrl, setBitableUrl] = useState(() => {
+    try {
+      const binding = JSON.parse(localStorage.getItem(bitableStorageKey) || "{}");
+      return String(binding.targetUrl || binding.bitableUrl || "");
+    } catch { return ""; }
+  });
+  const updateBitableUrl = (url: string) => {
+    setBitableUrl(url);
+    try { localStorage.setItem(bitableStorageKey, JSON.stringify({ targetUrl: url, bitableUrl: url })); }
+    catch { /* 当前页仍可使用输入的链接。 */ }
+  };
   const [bitableNewName, setBitableNewName] = useState("");
   const [taskCompleteVisible, setTaskCompleteVisible] = useState(false);
 
@@ -1066,40 +1082,61 @@ export default function PublishWarehousePage() {
   };
 
   // ── 导出 / 核查 ───────────────────────────────────────────────────────────
-  const readPendingDraftItems = async () => {
+  const readPendingDraftItems = async (allowCache = true) => {
+    const scope = { customerId, taskId: String(activeTask?._id || ""), topics: selectedTopics };
     try {
-      const response = await fetchWithRetry(apiUrl("/api/final-drafts"));
+      const params = new URLSearchParams();
+      if (scope.customerId) params.set("customerId", scope.customerId);
+      if (scope.taskId) params.set("taskId", scope.taskId);
+      const response = await fetchWithRetry(apiUrl(`/api/final-drafts?${params}`));
       const data = await response.json();
+      if (!response.ok || data?.success === false) throw new Error(data?.error || "读取保存记录失败");
       const list = Array.isArray(data?.items) ? data.items : [];
-      if (list.length > 0) return list;
-    } catch {
+      if (list.length > 0 || !allowCache) return filterExportDrafts(list, scope);
+    } catch (error) {
+      if (!allowCache) throw error;
       // 回落到浏览器缓存
     }
-    return readCachedFinalDrafts();
+    return filterExportDrafts(readCachedFinalDrafts(), scope);
   };
 
-  const exportAll = async (format: "feishu" | "bitable") => {
+  const exportAll = async (format: "feishu" | "bitable", block?: DraftExportBlock) => {
     setExporting(format);
     setError("");
     try {
       await selectionDrafts.flush();
-      const items = await readPendingDraftItems();
-      if (items.length === 0) throw new Error("暂无可导出的已保存文案，请先在最终文案编辑页保存");
+      const items = block
+        ? [pickDraftExportBlock({
+          topic: { id: activeTopicId, title: activeTopic?.title || "", shareLink: activeTopic?.link || activeTopic?.shareLink || "" },
+          customerId,
+          taskId: String(activeTask?._id || ""),
+          taskInfo: activeTask ? { id: String(activeTask._id || ""), customerName: activeTask.customerName, platformName: activeTask.platformName } : null,
+          publishWarehouse: buildPublishPayload(),
+        }, block)]
+        : (await readPendingDraftItems()).map(item => withCurrentPublishSelection(item, selectionDrafts.get(String(item.topic?.id || "")), accountConfirmed));
+      if (block && !hasDraftExportContent(items[0], block)) throw new Error("请先在当前选题、本块中选中要导出的内容。");
+      if (items.length === 0) throw new Error("本批暂无已保存文案，请在内容生成页保存；只需要封面、发布文案或标签时，可直接使用各块的导出按钮。");
       if (format === "feishu") {
         const response = await fetchWithRetry(apiUrl("/api/export/feishu"), {
           method: "POST",
+          retries: 0,
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ documentName: `${activeTask?.customerName || "选题"} - 选题复盘`, items }),
+          body: JSON.stringify({ documentName: block
+            ? `${activeTask?.customerName || "选题"} - ${TABS.find(tab => tab.id === block)?.label || "发布材料"} - ${compactTopicLabel(activeTopic?.title, 40)}`
+            : `${activeTask?.customerName || "选题"} - 选题复盘`, items }),
         });
         const data = await parseApiError(response);
         setMessage(`已写入飞书文档${data?.documentUrl ? `：${data.documentUrl}` : ""}`);
         if (data?.documentUrl) window.open(String(data.documentUrl), "_blank", "noopener,noreferrer");
       } else {
+        const targetUrl = bitableUrl.trim();
+        if (!/^https?:\/\/[^/]+\/base\/[^/?#]+/i.test(targetUrl)) throw new Error("请先在上方填写有效的飞书多维表格链接，或新建表格。");
         const response = await fetchWithRetry(apiUrl("/api/export/bitable"), {
           method: "POST",
+          retries: 0,
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            targetUrl: bitableUrl,
+            targetUrl,
             items,
             taskInfo: activeTask ? { customerName: String(activeTask.customerName || "") } : null,
           }),
@@ -1121,12 +1158,13 @@ export default function PublishWarehousePage() {
     try {
       const response = await fetchWithRetry(apiUrl("/api/export/bitable/create"), {
         method: "POST",
+        retries: 0,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: bitableNewName.trim() || undefined }),
       });
       const data = await parseApiError(response);
       const url = String(data?.bitableUrl || "");
-      setBitableUrl(url);
+      updateBitableUrl(url);
       setMessage(`已创建多维表格${url ? `：${url}` : ""}`);
       if (url) window.open(url, "_blank", "noopener,noreferrer");
     } catch (requestError) {
@@ -1143,48 +1181,25 @@ export default function PublishWarehousePage() {
    *    塞进 sessionStorage 会把配额撑爆、连带别的草稿一起丢。只有内嵌图时用 `coverInline` 如实标注。
    * 标签口径与后端 `buildPublishBundle` 一致：账号恒定标签 + 选题标签，统一补 `#`。
    */
-  const buildPublishPayload = () => {
-    const current = selectionDrafts.get(activeTopicId);
-    const cover = current?.cover.candidates.find(item => item.id === current.cover.selectedId);
-    const url = String(cover?.image?.url || "").trim();
-    const dataUrl = String(cover?.image?.dataUrl || "").trim();
-    const copyList = (current?.publishCopy?.selected || [])
-      .map(item => String(item || "").trim()).filter(Boolean);
-    const tagList = [...Object.values(accountConfirmed), ...(current?.topicTags.selected || [])]
-      .map(item => String(item || "").trim()).filter(Boolean)
-      .map(item => (item.startsWith("#") ? item : `#${item}`));
-    return {
-      coverUrl: /^https?:\/\//i.test(url) ? url : "",
-      coverTitle: String(cover?.title || ""),
-      coverPrompt: String(cover?.prompt || ""),
-      coverInline: !/^https?:\/\//i.test(url) && Boolean(dataUrl),
-      copy: copyList.join("\n"),
-      tags: Array.from(new Set(tagList)).join(" "),
-    };
-  };
+  const buildPublishPayload = () => buildPublishExport(selectionDrafts.get(activeTopicId), accountConfirmed);
 
   const goToFinalEditor = async () => {
     setError("");
     try {
       await selectionDrafts.flush();
+      if (!activeTopic) throw new Error("请先选择一条选题。");
+      const draft = (await readPendingDraftItems(false)).find(item => sameDraftTopic(item, activeTopic));
+      if (!draft || !hasDraftExportContent(draft, "content")) {
+        throw new Error("当前选题还没有已确认的文案，请返回内容生成页勾选并保存本条；只需发布材料时，可直接使用各块的导出按钮。");
+      }
+      const base = withCurrentPublishSelection(draft, selectionDrafts.get(activeTopicId), accountConfirmed);
+      const index = workflowGroups.findIndex(group => group.shareLink === (activeTopic.link || activeTopic.shareLink));
+      const payload = editorPayloadFromDraft(base, { id: workflowGroups[index]?.id || "", index: Math.max(0, index), total: workflowGroups.length });
+      sessionStorage.setItem("finalDraftPayload", JSON.stringify(payload));
+      navigate("/final-editor");
     } catch (requestError) {
-      setError(`选择尚未保存，暂不能进入最终编辑：${requestError instanceof Error ? requestError.message : "请重试保存"}`);
-      return;
+      setError(`暂不能进入最终编辑：${requestError instanceof Error ? requestError.message : "交接保存失败，请重试"}`);
     }
-    // 把本条的发布产出带给最终编辑页（那一页只读 `finalDraftPayload`，
-    // 并把它作为可编辑段落并入最终草稿，之后导出飞书文档与多维表格都带着它）。
-    const existing = loadJson<any>("finalDraftPayload", null);
-    const payload = {
-      ...(existing || {}),
-      publishWarehouse: buildPublishPayload(),
-      taskInfo: existing?.taskInfo || (activeTask ? {
-        id: String(activeTask._id || ""),
-        customerName: String(activeTask.customerName || ""),
-        platformName: String(activeTask.platformName || ""),
-      } : null),
-    };
-    sessionStorage.setItem("finalDraftPayload", JSON.stringify(payload));
-    navigate("/final-editor");
   };
 
   const confirmComplete = async () => {
@@ -1678,9 +1693,6 @@ export default function PublishWarehousePage() {
               <Button variant="outline" className={BTN_MD} onClick={() => navigate("/content")}>
                 返回内容生成
               </Button>
-              <Button className={BTN_PRIMARY} onClick={goToFinalEditor}>
-                进入最终文案编辑页
-              </Button>
             </div>
           </div>
           {!customerId && (
@@ -1691,7 +1703,7 @@ export default function PublishWarehousePage() {
         </div>
       </header>
 
-      {/* 统一节奏：子块间距全部 16px（space-y-4），不再各处自定义 mb。 */}
+        {/* 统一节奏：子块间距全部 16px（space-y-4），不再各处自定义 mb。 */}
       <main className="mx-auto max-w-[1200px] space-y-4 px-5 py-5 sm:px-8">
         {error && (
           <div className="rounded-lg border border-red-200/70 bg-red-50 px-3.5 py-2.5 text-xs leading-5 text-red-700">{error}</div>
@@ -1766,6 +1778,24 @@ export default function PublishWarehousePage() {
         {/* ── 3.1 封面 ─────────────────────────────────────────────────────── */}
         {/* 三种类型各一层；两个可复用 Agent（IP 形象照 / 个性化背景模板）在二、三类的层里按需引用。
             类型在**保存基底时**才落库，进来只是看一下。 */}
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-3">
+          <span className="mr-auto text-xs text-slate-600">当前选题 · {TABS.find(tab => tab.id === activeTab)?.label} · 仅导出已选内容</span>
+          <Button variant="outline" className={BTN_SM} disabled={Boolean(exporting) || !activeTopic} onClick={() => exportAll("feishu", activeTab)}>
+            导出本块到飞书文档
+          </Button>
+          <Button variant="outline" className={BTN_SM} disabled={Boolean(exporting) || !activeTopic} onClick={() => exportAll("bitable", activeTab)}>
+            导出本块到多维表格
+          </Button>
+          <div className="flex w-full min-w-0 flex-wrap items-center gap-2 border-t border-slate-100 pt-2">
+            <span className="text-xs text-slate-500">本任务导出表格</span>
+            <input value={bitableUrl} onChange={event => updateBitableUrl(event.target.value)} placeholder="粘贴已有表格 URL" className={`min-w-0 flex-1 ${INPUT_SM}`} />
+            <input value={bitableNewName} onChange={event => setBitableNewName(event.target.value)} placeholder="表格名称（可选）" className={`w-40 max-w-full ${INPUT_SM}`} />
+            <Button variant="outline" className={BTN_SM} disabled={Boolean(exporting)} onClick={createBitable}>
+              {exporting === "create" ? "创建中…" : "新建表格"}
+            </Button>
+          </div>
+        </div>
+
         {activeTab === "cover" && (
           <div className="space-y-3">
             {/* 类型页签：分段控件。原来每个页签下面还挂一行灰字说明，收进下面的单行说明里。 */}
@@ -2262,7 +2292,7 @@ export default function PublishWarehousePage() {
         )}
 
         {/* ── 3.3 发布标签 ─────────────────────────────────────────────────── */}
-        {/* 这一页是本轮最后一步，所以「核查与导出」也挂在这里 —— 3.1 / 3.2 不再出现它。 */}
+        {/* 各块可独立导出；标签页继续保留整批核查和导出入口。 */}
         {activeTab === "tags" && (
           <>
           <div className="grid gap-3 lg:grid-cols-2">
@@ -2388,7 +2418,7 @@ export default function PublishWarehousePage() {
           {/* ── 核查 + 导出 ───────────────────────────────────────────────────────── */}
           <Card className={`${CARD} mt-3`}>
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-semibold text-slate-900">核查与导出</CardTitle>
+              <CardTitle className="text-sm font-semibold text-slate-900">整批核查与导出</CardTitle>
             </CardHeader>
             <CardContent className="space-y-3">
               <div className="grid gap-2.5 sm:grid-cols-3">
@@ -2407,51 +2437,23 @@ export default function PublishWarehousePage() {
               </div>
 
               <div className="flex flex-wrap gap-2">
-                <Button className="h-9 rounded-lg bg-blue-600 px-3 text-xs font-semibold text-white hover:bg-blue-700" onClick={goToFinalEditor}>
+                <Button className="h-9 rounded-lg bg-blue-600 px-3 text-xs font-semibold text-white hover:bg-blue-700" onClick={goToFinalEditor} disabled={loadingSelections || accountTagsLoading || Boolean(exporting)}>
                   进入最终文案编辑页
                 </Button>
-                <Button variant="outline" className="h-9 rounded-lg px-3 text-xs" disabled={exporting === "feishu"} onClick={() => exportAll("feishu")}>
+                <Button variant="outline" className="h-9 rounded-lg px-3 text-xs" disabled={Boolean(exporting)} onClick={() => exportAll("feishu")}>
                   {exporting === "feishu" ? "写入中…" : "写入飞书文档"}
                 </Button>
-                <Button variant="outline" className="h-9 rounded-lg px-3 text-xs" disabled={exporting === "bitable"} onClick={() => exportAll("bitable")}>
+                <Button variant="outline" className="h-9 rounded-lg px-3 text-xs" disabled={Boolean(exporting)} onClick={() => exportAll("bitable")}>
                   {exporting === "bitable" ? "写入中…" : "写入多维表格"}
                 </Button>
                 {/* 导出读的是「已保存的最终文案」，没保存过会报「暂无可导出」。
                     这是唯一必须说清的前提，压成一行 + title 展开全文。 */}
                 <span
                   className="self-center text-[11px] text-slate-400"
-                  title="导出读的是已保存的最终文案（在最终文案编辑页点「保存最终文案」时产生）。还没保存过的话，先进入最终文案编辑页保存一条再回来导出 —— 封面、发布文案与发布标签会一并带进导出结果。"
+                  title="整批导出读取本任务、本批选题已保存的文案，并合入对应的发布选择；无需完成所有发布步骤。"
                 >
-                  导出需先保存最终文案
+                  整批导出使用本批已保存文案
                 </span>
-              </div>
-
-              <div className="rounded-xl border border-slate-200 px-3 py-2.5">
-                <div className="text-xs font-semibold text-slate-700">飞书多维表格</div>
-                <div className="mt-2 flex flex-wrap items-center gap-2">
-                  <input
-                    value={bitableNewName}
-                    onChange={event => setBitableNewName(event.target.value)}
-                    placeholder="表格名称（可选）"
-                    className={`min-w-[180px] flex-1 ${INPUT_SM}`}
-                  />
-                  <Button variant="outline" className="h-8 rounded-lg px-3 text-xs" disabled={exporting === "create"} onClick={createBitable}>
-                    {exporting === "create" ? "创建中…" : "新建表格"}
-                  </Button>
-                </div>
-                <div className="mt-2 flex flex-wrap items-center gap-2">
-                  <input
-                    value={bitableUrl}
-                    onChange={event => setBitableUrl(event.target.value)}
-                    placeholder="粘贴已有表格 URL"
-                    className={`min-w-[200px] flex-1 ${INPUT_SM}`}
-                  />
-                  {/* 绑定状态用点的颜色说话 */}
-                  <span className={`inline-flex items-center gap-1 text-[11px] ${bitableUrl ? "text-emerald-600" : "text-slate-400"}`}>
-                    <span className={`h-1.5 w-1.5 rounded-full ${bitableUrl ? "bg-emerald-500" : "bg-slate-300"}`} />
-                    {bitableUrl ? "已绑定" : "未绑定"}
-                  </span>
-                </div>
               </div>
 
               <Button

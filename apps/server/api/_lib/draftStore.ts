@@ -1,62 +1,45 @@
-import { normalizePublishWarehouse } from "./exportFormatters.js";
+import {
+  buildDraftItem,
+  clearDraftItems,
+  deleteDraftItem,
+  draftScopeKey,
+  listDraftItems,
+  upsertDraftItems,
+} from "./draftItems.js";
 
-const store = new Map<string, {
-  id: string;
-  createdAt: string;
-  titleDraft: string;
-  hookDraft: string;
-  endingHookDraft: string;
-  scriptDraft: string;
-  rewriteDraft: string;
-  translationDraft: string;
-  benchmarkVideos: Array<Record<string, unknown>>;
-  /** 发布仓三块产出；没经过发布仓时为 null（导出侧据此决定要不要追加那一段）。 */
-  publishWarehouse: Record<string, unknown> | null;
-}>();
+/**
+ * Vercel（serverless）侧的最终文案草稿 store。
+ *
+ * ⚠️ 这里存内存（每个 lambda 实例各一份，冷启动就丢），是历史实现；生产实际走
+ * Express + `/app/data/final-drafts.json`。但两套后端必须保持**同一套口径**，
+ * 所以归一化 / upsert / owner 过滤全部复用 `draftItems.js` 的纯函数，
+ * 这边只负责「把数组存在内存里」。
+ */
+let items: Array<Record<string, any>> = [];
 
-const MAX_ITEMS = 200;
+export const listDrafts = (ownerId: string, options: { customerId?: string; taskId?: string } = {}) =>
+  listDraftItems(items, ownerId, options);
 
-export const listDrafts = () => Array.from(store.values()).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-
-export const addDraft = (input: {
-  titleDraft?: string;
-  hookDraft?: string;
-  endingHookDraft?: string;
-  scriptDraft?: string;
-  rewriteDraft?: string;
-  translationDraft?: string;
-  benchmarkVideos?: Array<Record<string, unknown>>;
-  publishWarehouse?: Record<string, unknown> | null;
-}) => {
-  const item = {
-    id: `draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-    createdAt: new Date().toISOString(),
-    titleDraft: String(input.titleDraft || ""),
-    hookDraft: String(input.hookDraft || ""),
-    endingHookDraft: String(input.endingHookDraft || ""),
-    scriptDraft: String(input.scriptDraft || ""),
-    rewriteDraft: String(input.rewriteDraft || ""),
-    translationDraft: String(input.translationDraft || ""),
-    benchmarkVideos: Array.isArray(input.benchmarkVideos) ? input.benchmarkVideos : [],
-    publishWarehouse: input.publishWarehouse && typeof input.publishWarehouse === "object"
-      ? normalizePublishWarehouse(input.publishWarehouse)
-      : null,
-  };
-
-  store.set(item.id, item);
-
-  const all = listDrafts();
-  if (all.length > MAX_ITEMS) {
-    all.slice(MAX_ITEMS).forEach((draft) => store.delete(draft.id));
-  }
-
-  return item;
+export const addDraft = (input: Record<string, any>, ownerId: string) => {
+  const item = buildDraftItem(input, ownerId);
+  items = upsertDraftItems(items, item);
+  const scopeKey = draftScopeKey(item);
+  return (scopeKey ? items.find(entry => draftScopeKey(entry) === scopeKey) : items[0]) || item;
 };
 
-export const deleteDraft = (id: string) => store.delete(id);
+export const deleteDraft = (id: string, ownerId: string) => {
+  const result = deleteDraftItem(items, ownerId, id);
+  items = result.items;
+  return result.removed > 0;
+};
 
-export const clearDrafts = () => {
-  const size = store.size;
-  store.clear();
-  return size;
+export const clearDrafts = (ownerId: string) => {
+  const result = clearDraftItems(items, ownerId);
+  items = result.items;
+  return result.removed;
+};
+
+/** 仅供测试/诊断：清空内存 store（不区分 owner —— 测试里用完即弃）。 */
+export const resetDraftsForTest = () => {
+  items = [];
 };

@@ -37,6 +37,12 @@ const WORKSPACE_KEYS = [
   "sourcePlatform",
   "sourcePlatformUserLocked",
   "finalDraftPayload",
+  "contentWorkflowFailures",
+  "contentWorkflowFallbackNotes",
+  "contentWorkflowGroups",
+  "workflowRawDone",
+  "contentAutoRunConsumedKey",
+  "contentCustomerId",
 ];
 
 const clearWorkspaceState = () => {

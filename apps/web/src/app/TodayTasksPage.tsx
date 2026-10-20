@@ -275,7 +275,7 @@ export default function TodayTasksPage() {
    */
   const enterWorkspace = (task: TodayTask) => {
     sessionStorage.setItem("contentTasks", JSON.stringify([task]));
-    ["selectedTopics", "selectedTopicIds", "tikhubResults", "topicFetchContext", "contentAutoRunKey", "contentActiveGroupIndex", "sourcePlatform", "sourcePlatformUserLocked", "topicsAutoFetchKey", "topicsAutoFetchConsumedKey"].forEach(key => sessionStorage.removeItem(key));
+    ["selectedTopics", "selectedTopicIds", "tikhubResults", "topicFetchContext", "contentAutoRunKey", "contentActiveGroupIndex", "contentWorkflowFailures", "contentWorkflowFallbackNotes", "contentWorkflowGroups", "workflowRawDone", "contentAutoRunConsumedKey", "contentCustomerId", "sourcePlatform", "sourcePlatformUserLocked", "topicsAutoFetchKey", "topicsAutoFetchConsumedKey"].forEach(key => sessionStorage.removeItem(key));
     navigate("/topics");
   };
 

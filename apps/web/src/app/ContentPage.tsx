@@ -14,6 +14,20 @@ import {
 } from "./components/ui/accordion";
 import { Loader2, Layers, CheckCircle2, Sparkles, ChevronLeft, ChevronRight, Download, Link2, Plus, Unlink } from "lucide-react";
 import { clearCachedFinalDrafts, readCachedFinalDrafts } from "./finalDraftCache";
+import { ConfirmDialog } from "../components/common/ConfirmDialog";
+import {
+  CONTENT_TOPIC_CONCURRENCY,
+  CONTENT_TOPIC_TIMEOUT_MS,
+  findWorkflowGroupIndex,
+  hasWorkflowResult,
+  isFatalWorkflowError,
+  orderWorkflowGroupsByLinks,
+  pickReusableWorkflowGroups,
+  sameLink,
+} from "./contentWorkflowRun";
+import { mapWithConcurrency } from "./topicAnalysisPipeline";
+import { compactTopicLabel, editorPayloadFromDraft, filterExportDrafts, hasDraftExportContent, pickDraftExportBlock, sameDraftSelection, sameDraftTopic, withCurrentPublishSelection } from "./draftExport";
+import { getAccountTags, listPublishSelections } from "./publishWarehouseApi";
 
 type TopicLike = {
   id?: string;
@@ -117,6 +131,47 @@ type TranslationItem = {
 
 type RewritePlatform = "douyin" | "xiaohongshu" | "wechat";
 
+/**
+ * 服务端持久化的「按选题保存」草稿（`/api/final-drafts`）。
+ *
+ * 与浏览器 sessionStorage 的 `finalDraftPayload` 是两回事：那个只服务「当前这条 →
+ * 最终编辑页」的单次交接，一刷新就没了；这里按 owner/customer/task/topic 落库，
+ * 用来做「保存后一直保留、切题能恢复、不经过发布仓也能导出」。
+ */
+type SavedDraftSelection = {
+  selectedTitles?: string[];
+  selectedHooks?: string[];
+  selectedScripts?: string[];
+  rewriteSelection?: string[];
+  rewriteResults?: Array<{ id: string; original: string; rewritten: string; target: RewritePlatform }>;
+  translationItems?: TranslationItem[];
+  rewriteEnabled?: boolean;
+  translationEnabled?: boolean;
+  rewriteTarget?: RewritePlatform;
+  sourceGroupId?: string;
+  sourceGroupIndex?: number;
+  totalGroups?: number;
+};
+
+type SavedDraftItem = {
+  id: string;
+  createdAt: string;
+  updatedAt?: string;
+  ownerId?: string;
+  customerId?: string;
+  taskId?: string;
+  topic?: { id?: string; title?: string; shareLink?: string; platform?: string };
+  titleDraft?: string;
+  hookDraft?: string;
+  endingHookDraft?: string;
+  scriptDraft?: string;
+  rewriteDraft?: string;
+  translationDraft?: string;
+  benchmarkVideos?: BenchmarkVideo[];
+  selection?: SavedDraftSelection;
+  publishWarehouse?: any;
+};
+
 const fallbackResult: WorkflowResult = {
   titles: [],
   hooks: [],
@@ -130,6 +185,29 @@ const loadJson = <T,>(key: string, fallback: T): T => {
     return JSON.parse(raw) as T;
   } catch {
     return fallback;
+  }
+};
+
+/**
+ * 写 sessionStorage 但**不让失败冒泡**。
+ *
+ * 几十条选题的结果加起来可能有几百 KB；隐私模式 / 配额超限时 `setItem` 会抛异常。
+ * 这条链路里内存 state 已经是准的，缓存失败最多是「刷新后恢复不了」，
+ * 不能反过来把一条已经生成成功的选题标成失败。
+ */
+const safeSessionSet = (key: string, value: string) => {
+  try {
+    sessionStorage.setItem(key, value);
+  } catch {
+    // 忽略：缓存只用于刷新恢复
+  }
+};
+
+const safeSessionRemove = (key: string) => {
+  try {
+    sessionStorage.removeItem(key);
+  } catch {
+    // 忽略：缓存只用于刷新恢复
   }
 };
 
@@ -481,57 +559,20 @@ const buildBenchmarkVideos = (topics: TopicLike[]): BenchmarkVideo[] => {
   });
 };
 
-const sameLink = (a?: string, b?: string) => {
-  const left = String(a || "").trim();
-  const right = String(b || "").trim();
-  if (!left || !right) return false;
-  return left === right;
-};
-
-const hasWorkflowResult = (group?: WorkflowResultGroup | null) => {
-  const result = group?.result;
-  return Boolean(
-    result &&
-      ((Array.isArray(result.titles) && result.titles.length > 0) ||
-        (Array.isArray(result.hooks) && result.hooks.length > 0) ||
-        (Array.isArray(result.scripts) && result.scripts.length > 0)),
-  );
-};
-
-const pickReusableWorkflowGroups = (links: string[], groups: WorkflowResultGroup[]) => {
-  const used = new Set<number>();
-  return links
-    .map((link, index) => {
-      const groupIndex = groups.findIndex((group, candidateIndex) =>
-        !used.has(candidateIndex) && sameLink(group.shareLink, link) && hasWorkflowResult(group),
-      );
-      if (groupIndex < 0) return null;
-      used.add(groupIndex);
-      return {
-        ...groups[groupIndex],
-        id: `link-${index + 1}`,
-        shareLink: link,
-      };
-    })
-    .filter(Boolean) as WorkflowResultGroup[];
-};
-
-const orderWorkflowGroupsByLinks = (links: string[], groups: WorkflowResultGroup[]) => {
-  const used = new Set<number>();
-  return links
-    .map((link, index) => {
-      const groupIndex = groups.findIndex((group, candidateIndex) =>
-        !used.has(candidateIndex) && sameLink(group.shareLink, link) && hasWorkflowResult(group),
-      );
-      if (groupIndex < 0) return null;
-      used.add(groupIndex);
-      return {
-        ...groups[groupIndex],
-        id: `link-${index + 1}`,
-        shareLink: link,
-      };
-    })
-    .filter(Boolean) as WorkflowResultGroup[];
+/**
+ * 给一条「工作流输入」起一个给人看的名字（失败/待补跑列表用）。
+ *
+ * 抽到模块级是为了 `runWorkflow` 与渲染层共用同一套口径：左边选题列表用
+ * `topic.title`，而这里只有链接 / 视频号 topic，两者必须对得上，否则用户会以为
+ * 「未生成 2 条」和失败明细说的是不同选题。
+ */
+const getWorkflowInputTitle = (
+  input: { kind: "share_link" | "wechat_topic"; id: string; link: string; topic: TopicLike | null },
+  benchmarkVideos: BenchmarkVideo[],
+): string => {
+  if (input.kind === "wechat_topic") return String(input.topic?.title || input.id);
+  const matched = benchmarkVideos.find(video => sameLink(video.link, input.link));
+  return matched?.title || input.link || input.id;
 };
 
 const formatMetric = (value: number) => {
@@ -857,9 +898,56 @@ export default function ContentPage() {
   const [selectedScripts, setSelectedScripts] = useState<string[]>([]);
   const [workflowLoading, setWorkflowLoading] = useState(false);
   const [workflowError, setWorkflowError] = useState<string | null>(null);
+  /**
+   * 并发生成时的进度与失败明细。
+   *
+   * 串行版本没有这两项也能跑（只有一条在跑）；改成并发后用户需要知道
+   * 「现在完成了几条 / 哪几条挂了」，否则 30 条里失败 1 条会被当成整体卡住。
+   * 失败明细只做展示，不参与生成判断 —— 重试走 `runWorkflow({ force: false })`，
+   * 由 `pickReusableWorkflowGroups` 自动跳过已成功、重新跑缺的。
+   */
+  const [workflowProgress, setWorkflowProgress] = useState<{ done: number; failed: number; total: number } | null>(null);
+  // 失败明细持久化到 sessionStorage：刷新后仍能告诉用户「是哪 2 条、为什么失败」，
+  // 而不是只剩一个「补跑未生成（2）」按钮。只作展示，重试仍以「输入 vs 已有结果」为准。
+  const [workflowFailures, setWorkflowFailures] = useState<Array<{ id: string; title: string; message: string }>>(() => {
+    // 持久化数据不可全信：只接受 id/title/message 都是字符串的条目，避免一条脏数据把整页渲染打崩。
+    const stored = loadJson<unknown>("contentWorkflowFailures", []);
+    if (!Array.isArray(stored)) return [];
+    return stored.filter((item): item is { id: string; title: string; message: string } => {
+      const value = item as Record<string, unknown> | null;
+      return Boolean(value)
+        && typeof value?.id === "string"
+        && typeof value?.title === "string"
+        && typeof value?.message === "string";
+    });
+  });
+  /**
+   * 哪些选题的创作 Agent 用了「兜底结果」（模型失败/超时/429）。
+   *
+   * 服务端 `runCreativeAgents` 在单个 Agent 失败时会用规则兜底（文案兜底甚至直接
+   * 返回原脚本），payload 结构与正常结果一样 —— 界面上看不出区别。并发 3 条时
+   * 同时有 12 个模型调用，429/超时概率比串行高，所以把服务端 Progress 里的
+   * `fallbackCount` 收集起来，显式提醒用户「这几条建议重点检查」。
+   */
+  const [workflowFallbackNotes, setWorkflowFallbackNotes] = useState<Array<{ id: string; title: string; count: number }>>(() => {
+    // 兜底提示也要持久化：刷新后「哪些条目是规则兜底出来的」不能凭空消失，
+    // 否则用户会把原脚本/模板文案当成模型产物直接发出去。
+    const stored = loadJson<unknown>("contentWorkflowFallbackNotes", []);
+    if (!Array.isArray(stored)) return [];
+    return stored.filter((item): item is { id: string; title: string; count: number } => {
+      const value = item as Record<string, unknown> | null;
+      return Boolean(value)
+        && typeof value?.id === "string"
+        && typeof value?.title === "string"
+        && typeof value?.count === "number";
+    });
+  });
   const [streamPreview, setStreamPreview] = useState("");
   const [workflowRawDone, setWorkflowRawDone] = useState(() => sessionStorage.getItem("workflowRawDone") || "");
-  const [workflowGroups, setWorkflowGroups] = useState<WorkflowResultGroup[]>(() => loadJson<WorkflowResultGroup[]>("contentWorkflowGroups", []));
+  const [workflowGroups, setWorkflowGroups] = useState<WorkflowResultGroup[]>(() => {
+    const stored = loadJson<unknown>("contentWorkflowGroups", []);
+    return Array.isArray(stored) ? (stored as WorkflowResultGroup[]) : [];
+  });
   const [activeGroupIndex, setActiveGroupIndex] = useState(() => {
     const raw = Number(sessionStorage.getItem("contentActiveGroupIndex") || 0);
     return Number.isFinite(raw) ? Math.max(0, raw) : 0;
@@ -883,10 +971,42 @@ export default function ContentPage() {
   const [bitableCreateLoading, setBitableCreateLoading] = useState(false);
   const [bitableBindingError, setBitableBindingError] = useState<string | null>(null);
 
+  // ── 按选题保存 / 恢复 / 导出（2026-10-19）──────────────────────────────
+  const [savedDrafts, setSavedDrafts] = useState<SavedDraftItem[]>([]);
+  const [savedDraftsLoaded, setSavedDraftsLoaded] = useState(false);
+  const [savedDraftsError, setSavedDraftsError] = useState("");
+  const [saveDraftLoading, setSaveDraftLoading] = useState(false);
+  const [editorLoading, setEditorLoading] = useState(false);
+  const [saveDraftMessage, setSaveDraftMessage] = useState("");
+  const [clearDraftsOpen, setClearDraftsOpen] = useState(false);
+  const [clearDraftsLoading, setClearDraftsLoading] = useState(false);
+  const [deleteDraftTarget, setDeleteDraftTarget] = useState<SavedDraftItem | null>(null);
+  const [deleteDraftLoading, setDeleteDraftLoading] = useState(false);
+
+  /**
+   * 已经按哪一条「已保存草稿」还原过当前卡片的勾选。
+   *
+   * 用 `${group.id}:${draft.id}:${updatedAt}` 做指纹：切题会变 → 还原；
+   * 自己刚保存一次也会变（还原成刚保存的结果，等价）；用户保存后继续手工改动不会变，
+   * 不会被草稿轮询/刷新把改动冲掉。
+   */
+  const hydratedSavedDraftRef = useRef("");
+  const hydratedSavedGroupRef = useRef("");
+
   const workflowInFlightRef = useRef(false);
   const workflowRunIdRef = useRef(0);
   const workflowAbortControllerRef = useRef<AbortController | null>(null);
   const autoRunKeyRef = useRef("");
+  /**
+   * 并发完成后结果会**乱序到达**，而 `workflowGroups` 是按勾选顺序重排的数组。
+   * 如果用户已经在看第 2 条并勾了标题，这时第 1 条才完成、数组整体后移，
+   * `activeGroupIndex` 会指向另一条 → 选择被清空、卡片「跳走」。
+   * 这两个 ref 用来在每次 commit 时把「当前正在看的那条」按 shareLink 重新定位。
+   */
+  const workflowGroupsRef = useRef(workflowGroups);
+  workflowGroupsRef.current = workflowGroups;
+  const activeGroupIndexRef = useRef(activeGroupIndex);
+  activeGroupIndexRef.current = activeGroupIndex;
 
   const [rewriteEnabled, setRewriteEnabled] = useState(false);
   const [rewriteLoading, setRewriteLoading] = useState(false);
@@ -898,8 +1018,15 @@ export default function ContentPage() {
 
   const navigate = useNavigate();
 
-  const selectedTopics = loadJson<TopicLike[]>("selectedTopics", []);
-  const contentTasks = loadJson<any[]>("contentTasks", []);
+  /**
+   * ⚠️ 必须 memo：`loadJson` 每次渲染都会 `JSON.parse` 一遍 sessionStorage，返回新数组。
+   * 勾选几十条时 `selectedTopics` 里带着脚本与 rawData（整页可达数百 KB），
+   * 不 memo 的话每次渲染都要重新解析一次，并且把下游每个 useMemo 的依赖都打穿
+   * （shareLinks / workflowInputs / benchmarkVideos … 全部每帧重算）。
+   * 页面生命周期内这两份数据不会被本页改写，所以挂载时读一次即可。
+   */
+  const selectedTopics = useMemo(() => loadJson<TopicLike[]>("selectedTopics", []), []);
+  const contentTasks = useMemo(() => loadJson<any[]>("contentTasks", []), []);
   const activeTask = contentTasks?.[0];
   const bitableBindingKey = useMemo(() => bitableTaskKey(activeTask), [activeTask?._id, activeTask?.customerName]);
   const [cachedBitableBinding, setCachedBitableBinding] = useState<BitableBinding>(() => readBitableBinding(bitableTaskKey(activeTask)));
@@ -936,6 +1063,75 @@ export default function ContentPage() {
   ], [shareLinks, wechatTopics]);
   const workflowInputIds = useMemo(() => workflowInputs.map(item => item.id), [workflowInputs]);
   /**
+   * 还缺多少条结果（= 没生成 / 失败 / 本次被取消的都算）。
+   *
+   * 用它而不是内存里的 `workflowFailures.length` 做按钮文案：致命错误中止整批时，
+   * 后面的选题根本没跑、也不会进失败列表；刷新后失败列表更是直接消失。
+   * 以「输入条数 - 已有结果条数」为准，按钮说几条就真的补跑几条。
+   */
+  const missingInputs = useMemo(() => {
+    const reusable = pickReusableWorkflowGroups(workflowInputIds, workflowGroups);
+    return workflowInputs.filter(input => !reusable.some(group => sameLink(group.shareLink, input.id)));
+  }, [workflowInputs, workflowInputIds, workflowGroups]);
+  const missingGroupCount = missingInputs.length;
+  // 只展示「现在仍缺结果」的失败记录：重试成功后旧记录不能继续挂着吓人。
+  const visibleWorkflowFailures = useMemo(
+    () => workflowFailures.filter(item => missingInputs.some(input => input.id === item.id)),
+    [workflowFailures, missingInputs],
+  );
+  /** 只保留与当前勾选匹配、且已有结果的兜底提示（刷新/切换任务后不串数据）。 */
+  const matchedWorkflowGroups = useMemo(
+    () => orderWorkflowGroupsByLinks(workflowInputIds, workflowGroups),
+    [workflowInputIds, workflowGroups],
+  );
+  const visibleFallbackNotes = useMemo(
+    () => workflowFallbackNotes.filter(note => (
+      workflowInputIds.includes(note.id)
+      && matchedWorkflowGroups.some(group => sameLink(group.shareLink, note.id))
+    )),
+    [workflowFallbackNotes, workflowInputIds, matchedWorkflowGroups],
+  );
+  /**
+   * 「本次进入页面是否已经跑过一轮」的证据。
+   *
+   * 刷新发生在第一批完成之前时：groups / progress / failures 都是空的，但
+   * autoRunKey 已被消费（不会自动重跑）。此时「补跑未生成」按钮必须仍然出现，
+   * 否则页面会出现「未生成清单让你点按钮，但按钮不存在」的死路。
+   */
+  const autoRunKeyForEvidence = sessionStorage.getItem("contentAutoRunKey") || "";
+  const autoRunConsumed = Boolean(autoRunKeyForEvidence)
+    && sessionStorage.getItem("contentAutoRunConsumedKey") === autoRunKeyForEvidence;
+  const hasRunEvidence = workflowProgress !== null
+    || matchedWorkflowGroups.length > 0
+    || visibleWorkflowFailures.length > 0
+    || autoRunConsumed;
+  /** 勾选里没有可用链接的非视频号选题：它们不会成为工作流输入，必须如实说明。 */
+  const unusableTopics = useMemo(
+    () => selectedTopics.filter(topic => !isWeChatChannelsTopic(topic) && !String(getTopicShareLink(topic) || "").trim()),
+    [selectedTopics],
+  );
+  /** 重复链接：两条选题共用一份结果，计数上要说明，否则用户会以为丢了一条。 */
+  const duplicateLinkCount = useMemo(() => {
+    const seen = new Set<string>();
+    let duplicates = 0;
+    for (const id of workflowInputIds) {
+      if (seen.has(id)) duplicates += 1;
+      else seen.add(id);
+    }
+    return duplicates;
+  }, [workflowInputIds]);
+  /**
+   * 没有「选题页已提取脚本」的条数。
+   *
+   * 这类条目会在二创请求里**现场** TikHub 解析 + 本地 ffmpeg 抽音频 + ASR
+   * （单条约 60~160 秒，是自带脚本条目的 2~4 倍），正是「勾选几十条特别慢」的放大器。
+   * 提前显示条数，用户才知道时间花在哪，而不是以为并发没生效。
+   */
+  const missingScriptCount = useMemo(
+    () => selectedTopics.filter(topic => !String(topic?.content?.script || "").trim()).length,
+    [selectedTopics],
+  );
+  /**
    * 「链接 → 库内大类名」。
    *
    * 大类是「今日选题」页打标签时**已经判好**的（`topic.content.categoryName`），
@@ -965,6 +1161,46 @@ export default function ContentPage() {
     const matched = benchmarkVideos.filter(item => sameLink(item.link, activeGroup?.shareLink));
     return matched.length > 0 ? matched : benchmarkVideos;
   }, [selectedTopics, benchmarkVideos, activeGroup?.shareLink]);
+
+  /** 当前卡片对应的「工作流输入」（链接 / 视频号 key）。 */
+  const currentWorkflowInput = useMemo(
+    () => workflowInputs.find(input => sameLink(input.id, activeGroup?.shareLink)) || null,
+    [workflowInputs, activeGroup?.shareLink],
+  );
+  /** 当前卡片对应的原始选题（用来拿 topicId / 标题 / 平台）。 */
+  const currentTopic = useMemo(() => {
+    if (!currentWorkflowInput) return null;
+    if (currentWorkflowInput.kind === "wechat_topic") return currentWorkflowInput.topic;
+    return selectedTopics.find(topic => sameLink(getTopicShareLink(topic), currentWorkflowInput.id)) || null;
+  }, [currentWorkflowInput, selectedTopics]);
+  const currentTopicTitle = currentWorkflowInput
+    ? getWorkflowInputTitle(currentWorkflowInput, benchmarkVideos)
+    : "";
+
+  /** 一条草稿是否对应当前某个工作流输入（链接优先，视频号再按 topicId 兜底）。 */
+  const draftMatchesWorkflowInput = (draft: SavedDraftItem, input: (typeof workflowInputs)[number]) => {
+    if (!draft?.topic) return false;
+    if (draft.topic.shareLink && sameLink(draft.topic.shareLink, input.id)) return true;
+    const inputTopicId = String(input.kind === "wechat_topic" ? input.topic?.id || "" : "");
+    if (inputTopicId && draft.topic.id && sameLink(draft.topic.id, inputTopicId)) return true;
+    if (input.kind === "share_link") {
+      const topic = selectedTopics.find(item => sameLink(getTopicShareLink(item), input.id));
+      if (topic?.id && draft.topic.id && sameLink(String(topic.id), draft.topic.id)) return true;
+    }
+    return false;
+  };
+  const findSavedDraftForGroup = (group: WorkflowResultGroup | null) => {
+    if (!group) return null;
+    const input = workflowInputs.find(item => sameLink(item.id, group.shareLink));
+    if (!input) return null;
+    return savedDrafts.find(draft => draftMatchesWorkflowInput(draft, input)) || null;
+  };
+  const savedDraftForCurrentGroup = findSavedDraftForGroup(activeGroup);
+  /** 当前这批勾选里、已经有保存记录的草稿（导出列表与「已保存 N 条」都用它）。 */
+  const savedDraftsForCurrentInputs = useMemo(
+    () => savedDrafts.filter(draft => workflowInputs.some(input => draftMatchesWorkflowInput(draft, input))),
+    [savedDrafts, workflowInputs, selectedTopics],
+  );
 
   const toggleSelection = (value: string, list: string[], setList: (v: string[]) => void) => {
     setList(list.includes(value) ? list.filter(item => item !== value) : [...list, value]);
@@ -1003,8 +1239,17 @@ export default function ContentPage() {
     };
   }, []);
 
+  /**
+   * 切换卡片时：优先还原「这条选题上次保存的勾选」，没有保存记录才清空。
+   *
+   * 这是「保存过的记录不要被覆盖」的核心：用户切到别的选题再切回来，之前勾的
+   * 标题 / 3 秒 / 结尾钩子 / 二创文案（以及改写、翻译结果）都还在。
+   * ⚠️ 等 `savedDraftsLoaded` 后再决定要不要清空 —— 否则草稿列表还没回来就先清空，
+   *    会出现「先闪空、再恢复」的观感。
+   */
   useEffect(() => {
     if (!activeGroup) {
+      hydratedSavedDraftRef.current = "";
       setSelectedTitles([]);
       setSelectedHooks([]);
       setSelectedScripts([]);
@@ -1014,32 +1259,99 @@ export default function ContentPage() {
       return;
     }
 
-    setSelectedTitles([]);
-    setSelectedHooks([]);
-    setSelectedScripts([]);
-    setTranslationItems([]);
-    setRewriteSelection([]);
-    setRewriteResults([]);
-  }, [activeGroup?.id]);
+    const draft = findSavedDraftForGroup(activeGroup);
+    const switchedGroup = hydratedSavedGroupRef.current !== activeGroup.id;
+    hydratedSavedGroupRef.current = activeGroup.id;
+    if (!draft) {
+      if (!savedDraftsLoaded) return;
+      const key = `${activeGroup.id}:none`;
+      if (hydratedSavedDraftRef.current === key) return;
+      hydratedSavedDraftRef.current = key;
+      setSelectedTitles([]);
+      setSelectedHooks([]);
+      setSelectedScripts([]);
+      setTranslationItems([]);
+      setRewriteSelection([]);
+      setRewriteResults([]);
+      setSaveDraftMessage("");
+      return;
+    }
+
+    const key = `${activeGroup.id}:${draft.id}:${draft.updatedAt || draft.createdAt || ""}`;
+    if (hydratedSavedDraftRef.current === key) return;
+    hydratedSavedDraftRef.current = key;
+
+    const selection = draft.selection || {};
+    // 只还原「当前生成结果里仍然存在」的条目：重新生成后 id/文本可能已经变了，
+    // 硬套旧值会让界面显示成已勾选、实际却找不到对应候选。
+    const restoredTitles = (selection.selectedTitles || []).filter(item => workflowResult.titles.includes(item));
+    const restoredHooks = (selection.selectedHooks || []).filter(id => workflowResult.hooks.some(hook => hook.id === id));
+    const restoredScripts = (selection.selectedScripts || []).filter(id => workflowResult.scripts.some(script => script.id === id));
+    const restoredRewriteSelection = (selection.rewriteSelection || []).filter(id => workflowResult.scripts.some(script => script.id === id));
+
+    setSelectedTitles(restoredTitles);
+    setSelectedHooks(restoredHooks);
+    setSelectedScripts(restoredScripts);
+    setRewriteSelection(restoredRewriteSelection);
+    setRewriteResults(Array.isArray(selection.rewriteResults) ? selection.rewriteResults as any : []);
+    setTranslationItems(Array.isArray(selection.translationItems) ? selection.translationItems as any : []);
+    setRewriteEnabled(Boolean(selection.rewriteEnabled));
+    setTranslationEnabled(Boolean(selection.translationEnabled));
+    if (selection.rewriteTarget) setRewriteTarget(selection.rewriteTarget);
+
+    const savedSelectionCount = (selection.selectedTitles?.length || 0)
+      + (selection.selectedHooks?.length || 0)
+      + (selection.selectedScripts?.length || 0);
+    const restoredCount = restoredTitles.length + restoredHooks.length + restoredScripts.length;
+    if (savedSelectionCount > 0 && restoredCount === 0) {
+      setSaveDraftMessage("已保存记录与当前生成内容不一致（可能重新生成过），请重新勾选后再保存。");
+    } else if (switchedGroup) {
+      // 只在「切到另一条选题」时提示载入；刚保存后 updatedAt 变化会再次触发放映，
+      // 那时不能覆盖「已保存」的提示文案。
+      const savedAt = new Date(draft.updatedAt || draft.createdAt || Date.now());
+      setSaveDraftMessage(`已载入 ${savedAt.toLocaleString("zh-CN", { hour12: false })} 保存的记录`);
+    }
+  }, [activeGroup?.id, workflowResult, savedDrafts, savedDraftsLoaded]);
 
   useEffect(() => {
-    sessionStorage.setItem("contentActiveGroupIndex", String(activeGroupIndex));
+    safeSessionSet("contentActiveGroupIndex", String(activeGroupIndex));
   }, [activeGroupIndex]);
 
-  const refreshPendingDraftCount = async () => {
-    const cachedCount = readCachedFinalDrafts().length;
+  /** 已保存记录的列表地址（带上客户/任务范围；服务端再按登录用户隔离）。 */
+  const draftListUrl = () => {
+    const params = new URLSearchParams();
+    const customerId = sessionStorage.getItem("contentCustomerId") || "";
+    const taskId = String(activeTask?._id || "");
+    if (customerId) params.set("customerId", customerId);
+    if (taskId) params.set("taskId", taskId);
+    const query = params.toString();
+    return apiUrl(`/api/final-drafts${query ? `?${query}` : ""}`);
+  };
+
+  /** 读取「已保存记录」——按 客户 + 任务 收窄；服务端再按登录用户隔离。 */
+  const loadSavedDrafts = async () => {
     try {
-      const response = await fetchWithRetry(apiUrl("/api/final-drafts"));
-      const data = await response.json();
-      const list = Array.isArray(data?.items) ? data.items : [];
-      setPendingDraftCount(Math.max(list.length, cachedCount));
-    } catch {
-      setPendingDraftCount(cachedCount);
+      const response = await fetchWithRetry(draftListUrl());
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data?.success === false) {
+        throw new Error(data?.error || `读取已保存记录失败（HTTP ${response.status}）`);
+      }
+      const items = Array.isArray(data?.items) ? data.items.filter(Boolean) : [];
+      setSavedDrafts(items as SavedDraftItem[]);
+      setPendingDraftCount(items.length);
+      setSavedDraftsError("");
+    } catch (error) {
+      // 服务端读不到时仍保留浏览器缓存里的「待导出」计数，不让整个页面报错。
+      setPendingDraftCount(readCachedFinalDrafts().length);
+      setSavedDraftsError(error instanceof Error ? error.message : "读取已保存记录失败");
+    } finally {
+      setSavedDraftsLoaded(true);
     }
   };
 
   useEffect(() => {
-    refreshPendingDraftCount();
+    void loadSavedDrafts();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 只在挂载时读一次；保存/删除后手动刷新
   }, []);
 
   const parseTranslationPayload = (
@@ -1294,16 +1606,26 @@ export default function ContentPage() {
     }
   };
 
-  const readPendingDraftItems = async () => {
+  const readPendingDraftItems = async (allowCache = true) => {
     try {
-      const draftResp = await fetchWithRetry(apiUrl("/api/final-drafts"));
+      const draftResp = await fetchWithRetry(draftListUrl());
       const draftData = await draftResp.json();
+      if (!draftResp.ok || draftData?.success === false) throw new Error(draftData?.error || "读取保存记录失败");
       const list = Array.isArray(draftData?.items) ? draftData.items : [];
-      if (list.length > 0) return list;
-    } catch {
+      if (list.length > 0 || !allowCache) return filterExportDrafts(list, {
+        customerId: sessionStorage.getItem("contentCustomerId") || "",
+        taskId: String(activeTask?._id || ""),
+        topics: selectedTopics,
+      });
+    } catch (error) {
+      if (!allowCache) throw error;
       // fall back to browser cache below
     }
-    return readCachedFinalDrafts();
+    return filterExportDrafts(readCachedFinalDrafts(), {
+      customerId: sessionStorage.getItem("contentCustomerId") || "",
+      taskId: String(activeTask?._id || ""),
+      topics: selectedTopics,
+    });
   };
 
   const buildCombinedDraft = (items: any[]) => ({
@@ -1358,6 +1680,7 @@ export default function ContentPage() {
       const name = bitableNewName.trim() || undefined;
       const response = await fetchWithRetry(apiUrl("/api/export/bitable/create"), {
         method: "POST",
+        retries: 0,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, taskInfo }),
       });
@@ -1404,19 +1727,41 @@ export default function ContentPage() {
     setBatchExportMessage(null);
   };
 
-  const exportAllPendingDrafts = async (format: "feishu" | "bitable") => {
+  /**
+   * 导出全部「已保存记录」——**不经过发布仓**也能用（用户 2026-10-19 的要求）。
+   *
+   * 与服务端导出路由的契约：
+   *   · `{ documentName, items }` → 合并成一篇文章；每条一个「选题 N」标题；
+   *   · `{ items, taskInfo, targetUrl, feishuBitable }` → 一张多维表格里多条记录。
+   *
+   * ⚠️ 导出**不再自动清空记录**：用户明确要求记录一直保留；清空改为单独的显式操作。
+   */
+  const exportAllPendingDrafts = async (format: "feishu" | "bitable", currentOnly = false) => {
     setBatchExportLoading(true);
     setBatchExportMessage(null);
 
     try {
-      const items = await readPendingDraftItems();
-      if (items.length === 0) throw new Error("暂无可导出的已保存文案");
+      const currentPayload = currentOnly ? buildContentDraftPayload() : null;
+      const currentSaved = currentPayload && savedDraftForCurrentGroup
+        && sameDraftSelection(savedDraftForCurrentGroup.selection, currentPayload.selection)
+        ? savedDraftForCurrentGroup : null;
+      if (currentOnly && !currentSaved && !await saveCurrentDraft()) return;
+      const items = currentOnly
+        ? [pickDraftExportBlock(currentSaved || currentPayload!, "content")]
+        : await readPendingDraftItems();
+      if (items.length === 0) throw new Error("暂无可导出的已保存文案：请先在本页点「保存本条文案」");
 
       if (format === "feishu") {
         const response = await fetchWithRetry(apiUrl("/api/export/feishu"), {
           method: "POST",
+          retries: 0,
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(buildCombinedDraft(items)),
+          body: JSON.stringify({
+            documentName: currentOnly
+              ? `${taskTableName} - 二创 - ${compactTopicLabel(currentTopicTitle, 40)}`
+              : `${taskTableName} - ${new Date().toISOString().slice(0, 10)}`,
+            items,
+          }),
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data?.success) {
@@ -1424,55 +1769,53 @@ export default function ContentPage() {
         }
         const documentUrl = String(data?.documentUrl || "");
         if (documentUrl) window.open(documentUrl, "_blank", "noopener,noreferrer");
+        setBatchExportMessage(`已写入飞书文档（${items.length} 条记录，记录已保留）`);
       } else if (format === "bitable") {
-        // 必须先创建/绑定一份多维表格，任务内所有选题写入同一份表格
-        if (!cachedBitableBinding.appToken) {
+        if (!cachedBitableBinding.appToken && !cachedBitableBinding.targetUrl && !cachedBitableBinding.bitableUrl) {
           throw new Error("请先创建一份新的多维表格，或绑定已有的多维表格 URL，再写入数据。");
         }
-
-        let binding: BitableBinding = {
+        const binding: BitableBinding = {
           targetUrl: cachedBitableBinding.targetUrl || cachedBitableBinding.bitableUrl || "",
           appToken: cachedBitableBinding.appToken || "",
           tableId: cachedBitableBinding.tableId || "",
           tableName: cachedBitableBinding.tableName || taskTableName,
           bitableUrl: cachedBitableBinding.bitableUrl || "",
         };
-
-        for (const item of items) {
-          const response = await fetchWithRetry(apiUrl("/api/export/bitable"), {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              ...item,
-              taskInfo: item?.taskInfo || buildCombinedDraft([item]).taskInfo,
-              feishuBitable: {
-                targetUrl: binding.targetUrl || "",
-                appToken: binding.appToken || "",
-                tableId: binding.tableId || "",
-                tableName: binding.tableName || taskTableName,
-              },
-            }),
-          });
-          const data = await response.json().catch(() => ({}));
-          if (!response.ok || !data?.success) {
-            throw new Error(data?.error || `写入飞书多维表格失败（HTTP ${response.status}）`);
-          }
-          binding = {
-            targetUrl: binding.targetUrl || "",
-            appToken: String(data?.appToken || binding.appToken || ""),
-            tableId: String(data?.tableId || binding.tableId || ""),
-            tableName: String(data?.tableName || binding.tableName || taskTableName),
-            bitableUrl: String(data?.bitableUrl || binding.bitableUrl || ""),
-          };
-          writeBitableBinding(bitableBindingKey, binding);
-          setCachedBitableBinding(binding);
+        const response = await fetchWithRetry(apiUrl("/api/export/bitable"), {
+          method: "POST",
+          retries: 0,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            items,
+            taskInfo: {
+              id: String(activeTask?._id || ""),
+              customerName: String(activeTask?.customerName || ""),
+              ownerName: String(activeTask?.ownerName || ""),
+              platformName: String(activeTask?.platformName || ""),
+            },
+            targetUrl: binding.targetUrl,
+            feishuBitable: binding,
+          }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.success) {
+          throw new Error(data?.error || `写入飞书多维表格失败（HTTP ${response.status}）`);
         }
-        if (binding.bitableUrl) window.open(binding.bitableUrl, "_blank", "noopener,noreferrer");
+        const nextBinding: BitableBinding = {
+          targetUrl: binding.targetUrl,
+          appToken: String(data?.appToken || binding.appToken || ""),
+          tableId: String(data?.tableId || binding.tableId || ""),
+          tableName: String(data?.tableName || binding.tableName || taskTableName),
+          bitableUrl: String(data?.bitableUrl || binding.bitableUrl || ""),
+        };
+        writeBitableBinding(bitableBindingKey, nextBinding);
+        setCachedBitableBinding(nextBinding);
+        setBitableTargetUrl(nextBinding.targetUrl || nextBinding.bitableUrl || "");
+        if (nextBinding.bitableUrl) window.open(nextBinding.bitableUrl, "_blank", "noopener,noreferrer");
+        setBatchExportMessage(`已写入飞书多维表格（${items.length} 条记录，记录已保留）`);
       }
 
-      await clearAllPendingDrafts();
-      await refreshPendingDraftCount();
-      setBatchExportMessage("导出并清空完成，待导出已更新为 0");
+      await loadSavedDrafts();
     } catch (error) {
       setBatchExportMessage(error instanceof Error ? error.message : "批量导出失败");
     } finally {
@@ -1514,7 +1857,190 @@ export default function ContentPage() {
       sourceGroupId: activeGroup?.id || null,
       sourceGroupIndex: activeGroupIndex,
       totalGroups: workflowGroups.length,
+      // 最终编辑页保存时也要带身份与勾选：否则它写出的草稿没有 topicId，
+      // 内容页再保存一次就会变成两条重复记录（内容页 -> 发布仓 -> 最终编辑页 是常规路径）。
+      topic: currentTopic || currentWorkflowInput ? {
+        id: String(currentTopic?.id || currentWorkflowInput?.id || ""),
+        title: currentTopicTitle,
+        shareLink: currentWorkflowInput?.id || "",
+        platform: String(currentTopic?.platform || shareLinkPlatform),
+      } : null,
+      customerId: sessionStorage.getItem("contentCustomerId") || "",
+      taskId: String(activeTask?._id || ""),
+      selection: {
+        selectedTitles: selectedTitleBlocks,
+        selectedHooks: selectedHooks,
+        selectedScripts: selectedScripts,
+        rewriteSelection,
+        rewriteResults,
+        translationItems,
+        rewriteEnabled,
+        translationEnabled,
+        rewriteTarget,
+        sourceGroupId: activeGroup?.id || "",
+        sourceGroupIndex: activeGroupIndex,
+        totalGroups: workflowGroups.length,
+      },
     };
+  };
+
+  /**
+   * 组装「保存到服务端」的当前选题草稿。
+   *
+   * 与 `buildFinalDraftPayload`（交给最终编辑页的 sessionStorage 交接稿）不同：
+   * 这份要带 owner/customer/task/topic 身份与勾选快照，服务端按
+   * `owner|customer|task|topic` upsert —— 同一选题再保存是更新，不同选题不会互相覆盖。
+   */
+  const buildContentDraftPayload = () => {
+    const selectedTitleBlocks = workflowResult.titles.filter(item => selectedTitles.includes(item));
+    const selectedHookObjects = workflowResult.hooks.filter(item => selectedHooks.includes(item.id));
+    const selectedScriptObjects = workflowResult.scripts.filter(item => selectedScripts.includes(item.id));
+
+    const openingHooks = selectedHookObjects.filter(item => item.hookType !== "ending_text");
+    const endingHooks = selectedHookObjects.filter(item => item.hookType === "ending_text");
+
+    const titleDraft = selectedTitleBlocks.map((item, index) => {
+      const display = formatTitleDisplay(item);
+      return `${index + 1}. ${display.titleLabel}${display.detailLines.length ? `\n${display.detailLines.join("\n")}` : ""}`;
+    }).join("\n\n");
+    const hookDraft = openingHooks.map((item, index) => `${index + 1}. ${item.content}`).join("\n\n");
+    const endingHookDraft = endingHooks.map((item, index) => `${index + 1}. ${item.content}`).join("\n\n");
+    const scriptDraft = selectedScriptObjects.map((item, index) => `【文案 ${index + 1}】\n${item.content}`).join("\n\n");
+    const rewriteDraft = rewriteResults.map((item, index) => `【${index + 1} | ${item.target}】\n${item.rewritten}`).join("\n\n");
+    const translationDraft = translationItems
+      .map((item, index) => `【${index + 1} | ${item.sourceType}】\nZH: ${item.zh}\nEN: ${item.en}`)
+      .join("\n\n");
+
+    return {
+      topic: {
+        id: String(currentTopic?.id || currentWorkflowInput?.id || ""),
+        title: currentTopicTitle,
+        shareLink: currentWorkflowInput?.id || "",
+        platform: String(currentTopic?.platform || shareLinkPlatform),
+      },
+      customerId: sessionStorage.getItem("contentCustomerId") || "",
+      taskId: String(activeTask?._id || ""),
+      titleDraft,
+      hookDraft,
+      endingHookDraft,
+      scriptDraft,
+      rewriteDraft,
+      translationDraft,
+      benchmarkVideos: activeBenchmarkVideos,
+      taskInfo: activeTask ? {
+        id: String(activeTask._id || ""),
+        customerName: String(activeTask.customerName || ""),
+        ownerName: String(activeTask.ownerName || ""),
+        platformName: String(activeTask.platformName || ""),
+        contentDirection: String(activeTask.contentDirection || ""),
+      } : null,
+      // 发布仓字段不在这里覆盖：服务端 upsert 时若本次没带 publishWarehouse 会保留旧值，
+      // 所以「内容页保存」不会把发布仓挑好的封面/文案/标签冲掉。
+      publishWarehouse: null,
+      selection: {
+        selectedTitles: selectedTitleBlocks,
+        selectedHooks,
+        selectedScripts,
+        rewriteSelection,
+        rewriteResults,
+        translationItems,
+        rewriteEnabled,
+        translationEnabled,
+        rewriteTarget,
+        sourceGroupId: activeGroup?.id || "",
+        sourceGroupIndex: activeGroupIndex,
+        totalGroups: workflowGroups.length,
+      },
+    };
+  };
+
+  const hasCurrentSelection = () => (
+    workflowResult.titles.some(item => selectedTitles.includes(item))
+    || workflowResult.hooks.some(item => selectedHooks.includes(item.id))
+    || workflowResult.scripts.some(item => selectedScripts.includes(item.id))
+  );
+
+  /** 保存当前卡片（服务端持久化；同一选题再保存=更新）。不改变当前浏览位置。 */
+  const saveCurrentDraft = async () => {
+    if (!activeGroup) {
+      setSaveDraftMessage("请先选择一条已有生成结果的选题。");
+      return false;
+    }
+    if (!hasCurrentSelection()) {
+      setSaveDraftMessage("请先在标题 / 3 秒留存 / 结尾钩子 / 二创文案中至少勾选一项，再保存。");
+      return false;
+    }
+    setSaveDraftLoading(true);
+    setSaveDraftMessage("");
+    try {
+      const response = await fetchWithRetry(apiUrl("/api/final-drafts"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildContentDraftPayload()),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data?.success === false) {
+        throw new Error(data?.error || `保存失败（HTTP ${response.status}）`);
+      }
+      await loadSavedDrafts();
+      setSaveDraftMessage(`本条文案已保存（${new Date().toLocaleTimeString("zh-CN", { hour12: false })}）`);
+      return true;
+    } catch (error) {
+      setSaveDraftMessage(error instanceof Error ? error.message : "保存失败");
+      return false;
+    } finally {
+      setSaveDraftLoading(false);
+    }
+  };
+
+  const jumpToSavedDraft = (draft: SavedDraftItem) => {
+    const shareLink = String(draft?.topic?.shareLink || "").trim();
+    const index = shareLink
+      ? workflowGroups.findIndex(group => sameLink(group.shareLink, shareLink))
+      : -1;
+    if (index < 0) {
+      setSaveDraftMessage("这条记录对应的选题不在当前批次里（可能换了任务/客户），无法跳转。");
+      return;
+    }
+    setActiveGroupIndex(index);
+    safeSessionSet("contentActiveGroupIndex", String(index));
+  };
+
+  const deleteSavedDraft = async () => {
+    if (!deleteDraftTarget) return;
+    setDeleteDraftLoading(true);
+    try {
+      const response = await fetchWithRetry(apiUrl(`/api/final-drafts/${encodeURIComponent(deleteDraftTarget.id)}`), { method: "DELETE" });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data?.success === false) {
+        throw new Error(data?.error || `删除失败（HTTP ${response.status}）`);
+      }
+      await loadSavedDrafts();
+      setSaveDraftMessage("已删除这条保存记录。");
+      setDeleteDraftTarget(null);
+    } catch (error) {
+      setSaveDraftMessage(error instanceof Error ? error.message : "删除失败");
+    } finally {
+      setDeleteDraftLoading(false);
+    }
+  };
+
+  const clearSavedDrafts = async () => {
+    setClearDraftsLoading(true);
+    try {
+      const response = await fetchWithRetry(apiUrl("/api/final-drafts"), { method: "DELETE" });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data?.success === false) {
+        throw new Error(data?.error || `清空失败（HTTP ${response.status}）`);
+      }
+      await loadSavedDrafts();
+      setSaveDraftMessage("已清空本任务下的保存记录。");
+      setClearDraftsOpen(false);
+    } catch (error) {
+      setSaveDraftMessage(error instanceof Error ? error.message : "清空失败");
+    } finally {
+      setClearDraftsLoading(false);
+    }
   };
 
   /**
@@ -1525,15 +2051,53 @@ export default function ContentPage() {
    * ⚠️ 但要**先把当前这批的分组结果落盘**：用户在内容生成页可能刚点了「重新生成」，
    *    `workflowGroups` 还只在内存里，不落盘的话发布仓读不到 3.2 要复用的标题与 3s。
    */
-  const goToPublishWarehouse = () => {
+  const goToPublishWarehouse = async () => {
+    // 先持久化当前选择，返回内容页时才有可恢复的勾选。
+    const current = buildContentDraftPayload();
+    const unchanged = savedDraftForCurrentGroup && sameDraftSelection(savedDraftForCurrentGroup.selection, current.selection);
+    if (hasCurrentSelection() && !unchanged && !await saveCurrentDraft()) return;
     try {
       sessionStorage.setItem("contentWorkflowGroups", JSON.stringify(workflowGroups));
       // 发布仓会在最终编辑页的负载上追加封面与标签，所以底稿由这里落盘（见 buildFinalDraftPayload）。
-      sessionStorage.setItem("finalDraftPayload", JSON.stringify(buildFinalDraftPayload()));
+      const payload = unchanged
+        ? editorPayloadFromDraft(savedDraftForCurrentGroup!, { id: activeGroup?.id || "", index: activeGroupIndex, total: workflowGroups.length })
+        : buildFinalDraftPayload();
+      sessionStorage.setItem("finalDraftPayload", JSON.stringify(payload));
     } catch {
-      // sessionStorage 不可用时不阻断导航（发布仓会退化成「没有可复用标题」并如实提示）。
+      setSaveDraftMessage("交接内容未能写入浏览器，已留在当前页。请重试；已保存的文案仍会保留。");
+      return;
     }
     navigate("/publish-warehouse");
+  };
+
+  const goToFinalEditor = async () => {
+    setEditorLoading(true);
+    setSaveDraftMessage("");
+    try {
+      if (!activeGroup || !currentTopic) throw new Error("请先选择一条已有生成结果的选题。");
+      const current = buildContentDraftPayload();
+      let draft = (await readPendingDraftItems(false)).find(item => sameDraftTopic(item, currentTopic));
+      if (hasCurrentSelection() && !sameDraftSelection(draft?.selection, current.selection)) {
+        if (!await saveCurrentDraft()) return;
+        draft = (await readPendingDraftItems(false)).find(item => sameDraftTopic(item, currentTopic));
+      }
+      if (!draft || !hasDraftExportContent(draft, "content")) {
+        throw new Error("请先勾选当前选题的文案，再进入最终文案编辑页。");
+      }
+      const customerId = sessionStorage.getItem("contentCustomerId") || "";
+      const [selections, library] = customerId
+        ? await Promise.all([listPublishSelections(customerId), getAccountTags(customerId)])
+        : [[], null];
+      const merged = withCurrentPublishSelection(draft, selections.find(item => item.topicId === draft.topic?.id), library?.confirmed || {});
+      sessionStorage.setItem("finalDraftPayload", JSON.stringify(editorPayloadFromDraft(merged, {
+        id: activeGroup.id, index: activeGroupIndex, total: workflowGroups.length,
+      })));
+      navigate("/final-editor");
+    } catch (error) {
+      setSaveDraftMessage(`暂不能进入最终编辑：${error instanceof Error ? error.message : "读取或交接保存失败，请重试"}`);
+    } finally {
+      setEditorLoading(false);
+    }
   };
 
   // 结束本次任务：解绑当前任务的多维表格（仅清前端 binding，飞书侧表格保留）
@@ -1582,17 +2146,20 @@ export default function ContentPage() {
       const orderedReusableGroups = orderWorkflowGroupsByLinks(workflowInputIds, reusableGroups);
       setWorkflowRawDone("");
       setWorkflowGroups(orderedReusableGroups);
-      sessionStorage.removeItem("workflowRawDone");
-      sessionStorage.setItem("contentWorkflowGroups", JSON.stringify(orderedReusableGroups));
+      safeSessionRemove("workflowRawDone");
+      safeSessionSet("contentWorkflowGroups", JSON.stringify(orderedReusableGroups));
       setActiveGroupIndex(index => {
         const nextIndex = Math.min(Math.max(0, index), Math.max(0, orderedReusableGroups.length - 1));
-        sessionStorage.setItem("contentActiveGroupIndex", String(nextIndex));
+        safeSessionSet("contentActiveGroupIndex", String(nextIndex));
         return nextIndex;
       });
     }
 
     if (inputsToGenerate.length === 0) {
       setWorkflowError(null);
+      setWorkflowFailures([]);
+      setWorkflowFallbackNotes([]);
+      setWorkflowProgress(null);
       setStreamPreview("");
       return;
     }
@@ -1608,35 +2175,43 @@ export default function ContentPage() {
 
     setWorkflowLoading(true);
     setWorkflowError(null);
+    setWorkflowFailures([]);
+    // 兜底提示只清掉「这次要重跑的那几条」：补跑 2 条时，其他 48 条的兜底提示不能被一起抹掉。
+    setWorkflowFallbackNotes(previous => (
+      force
+        ? []
+        : previous.filter(note => !inputsToGenerate.some(input => input.id === note.id))
+    ));
+    setWorkflowProgress({ done: 0, failed: 0, total: inputsToGenerate.length });
     setStreamPreview("");
     if (force) {
       setWorkflowRawDone("");
       setWorkflowGroups([]);
       setActiveGroupIndex(0);
-      sessionStorage.removeItem("workflowRawDone");
-      sessionStorage.setItem("contentWorkflowGroups", "[]");
-      sessionStorage.setItem("contentActiveGroupIndex", "0");
+      safeSessionRemove("workflowRawDone");
+      safeSessionSet("contentWorkflowGroups", "[]");
+      safeSessionSet("contentActiveGroupIndex", "0");
     } else {
       setWorkflowRawDone("");
-      sessionStorage.removeItem("workflowRawDone");
+      safeSessionRemove("workflowRawDone");
       setWorkflowGroups(reusableGroups);
-      sessionStorage.setItem("contentWorkflowGroups", JSON.stringify(reusableGroups));
+      safeSessionSet("contentWorkflowGroups", JSON.stringify(reusableGroups));
       setActiveGroupIndex(index => {
         const nextIndex = Math.min(Math.max(0, index), Math.max(0, reusableGroups.length - 1));
-        sessionStorage.setItem("contentActiveGroupIndex", String(nextIndex));
+        safeSessionSet("contentActiveGroupIndex", String(nextIndex));
         return nextIndex;
       });
     }
 
     try {
-      const MAX_INPUTS_PER_BATCH = 1;
-      const batches: typeof workflowInputs[] = [];
-      for (let i = 0; i < inputsToGenerate.length; i += MAX_INPUTS_PER_BATCH) {
-        batches.push(inputsToGenerate.slice(i, i + MAX_INPUTS_PER_BATCH));
-      }
-
       const allGroups: WorkflowResultGroup[] = [...reusableGroups];
-      const allRawPayloads: string[] = [];
+      // 每条选题的原始 Done payload，按「勾选项顺序」存：并发完成顺序是乱的，
+      // 调试用的合并文本不能跟着乱（否则排查问题时看到的是随机顺序）。
+      const payloadByIndex: string[] = new Array(inputsToGenerate.length).fill("");
+      const failures: Array<{ id: string; title: string; message: string }> = [];
+      let fatalError: Error | null = null;
+      let finishedCount = 0;
+      let failedCount = 0;
 
       const ensureCurrentRun = () => {
         if (!isCurrentRun()) {
@@ -1646,18 +2221,41 @@ export default function ContentPage() {
 
       const commitPartialResults = () => {
         ensureCurrentRun();
-        const combinedPayload = allRawPayloads.join("\n\n");
+        const combinedPayload = payloadByIndex.filter(Boolean).join("\n\n");
         const orderedGroups = orderWorkflowGroupsByLinks(workflowInputIds, allGroups);
+        // 并发下数组会随完成顺序重排：把「当前正在看的那条」按 shareLink 重新定位，
+        // 否则用户刚勾的标题会随着 index 指向变化被清空、卡片跳走。
+        const previousActiveLink = String(
+          workflowGroupsRef.current[activeGroupIndexRef.current]?.shareLink || "",
+        ).trim();
         setWorkflowRawDone(combinedPayload);
-        sessionStorage.setItem("workflowRawDone", combinedPayload);
         setWorkflowGroups(orderedGroups);
-        sessionStorage.setItem("contentWorkflowGroups", JSON.stringify(orderedGroups));
+        if (previousActiveLink) {
+          const nextIndex = findWorkflowGroupIndex(orderedGroups, previousActiveLink);
+          if (nextIndex >= 0 && nextIndex !== activeGroupIndexRef.current) {
+            setActiveGroupIndex(nextIndex);
+            safeSessionSet("contentActiveGroupIndex", String(nextIndex));
+          }
+        }
+        // 结果已经落到 state（内存）里，缓存写失败不应该把这条生成算成失败；
+        // 缓存只影响刷新后能否恢复。
+        safeSessionSet("workflowRawDone", combinedPayload);
+        safeSessionSet("contentWorkflowGroups", JSON.stringify(orderedGroups));
       };
 
-      for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+      /**
+       * 一条选题的完整生成流程（请求 + SSE 解析 + 合并结果）。
+       *
+       * ⚠️ 每条**单独发一个请求**，不再把多条塞进一个请求：
+       *   · 失败隔离：一条链接失效 / 一次模型超时只影响这一条，不会连坐整批；
+       *   · 进度真实：哪条先完成就先把哪条合并进界面；
+       *   · 后端 `runContentAgent` 内部本来就是逐条串行，塞多条只省 HTTP 往返、
+       *     省不了模型时间 —— 真正的提速必须在这里并发。
+       */
+      const runOneTopic = async (input: (typeof workflowInputs)[number], inputIndex: number) => {
         ensureCurrentRun();
 
-        const batchInputs = batches[batchIndex];
+        const batchInputs = [input];
         const batchIds = batchInputs.map(item => item.id);
         const batchLinksText = batchInputs
           .filter(item => item.kind === "share_link")
@@ -1666,6 +2264,12 @@ export default function ContentPage() {
         const batchWechatTopics = batchInputs
           .filter(item => item.kind === "wechat_topic" && item.topic)
           .map(item => item.topic);
+
+        // 单条看门狗：一条卡死时不能永远占着并发槽位（并发 3 时 3 条都卡住就整批不动）。
+        // 超时只中止这一条，不碰整轮 controller。
+        const topicSignal = typeof AbortSignal.any === "function" && typeof AbortSignal.timeout === "function"
+          ? AbortSignal.any([controller.signal, AbortSignal.timeout(CONTENT_TOPIC_TIMEOUT_MS)])
+          : controller.signal;
 
         const response = await fetch(apiUrl("/api/agent/workflow/stream-run"), {
           method: "POST",
@@ -1717,12 +2321,14 @@ export default function ContentPage() {
               ].filter(video => video.link && video.script),
             },
           }),
-          signal: controller.signal,
+          signal: topicSignal,
         });
 
         if (!response.ok || !response.body) {
           const text = await response.text();
-          throw new Error(text || `HTTP ${response.status}`);
+          const error = new Error(text || `HTTP ${response.status}`);
+          (error as any).status = response.status;
+          throw error;
         }
 
         const reader = response.body.getReader();
@@ -1731,11 +2337,21 @@ export default function ContentPage() {
         let donePayload = "";
         let batchPreview = "";
         let seenDone = false;
+        let emptyPayload = false;
 
         while (true) {
           ensureCurrentRun();
 
-          const { value, done } = await reader.read();
+          let readResult;
+          try {
+            readResult = await reader.read();
+          } catch (error) {
+            // 已经收到 Done 且结果已提交：之后连接被重置/超时是服务端收尾问题，
+            // 不能把这条已经成功的选题标成失败（否则 summary 与 groups 会自相矛盾）。
+            if (seenDone) break;
+            throw error;
+          }
+          const { value, done } = readResult;
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
@@ -1772,39 +2388,116 @@ export default function ContentPage() {
               }
             }
 
+            if (event === "Progress") {
+              // 服务端在单个创作 Agent 失败时会用规则兜底，产物照样有内容、界面上
+              // 看不出区别。把 fallback 计数收集起来，生成完显式提示「这几条要重点检查」。
+              const step = String(data?.step || "");
+              const fallbackCount = Number(data?.fallbackCount || 0);
+              const isFallbackStep = step === "creative-agents-fallback"
+                || (step === "creative-agents-ready" && fallbackCount > 0);
+              if (isFallbackStep && isCurrentRun()) {
+                const count = step === "creative-agents-fallback" ? 4 : fallbackCount;
+                setWorkflowFallbackNotes(previous => (
+                  previous.some(item => item.id === input.id)
+                    ? previous
+                    : [...previous, { id: input.id, title: getWorkflowInputTitle(input, benchmarkVideos), count }]
+                ));
+              }
+            }
+
             if (event === "Error") {
-              throw new Error(data?.error_message || `工作流执行失败（批次 ${batchIndex + 1}/${batches.length}）`);
+              // 保住后端给的状态码 / 错误码：401 / 凭证缺失要能被判定成「致命」，
+              // 立刻停掉其他在途请求，而不是让剩下几十条陪跑一遍。
+              const error = new Error(data?.error_message || `「${getWorkflowInputTitle(input, benchmarkVideos)}」生成失败`);
+              (error as any).status = Number(data?.status) || 0;
+              (error as any).code = String(data?.code || "");
+              throw error;
             }
 
             if (event === "Done") {
               seenDone = true;
               const payloadText = donePayload || batchPreview;
-              allRawPayloads.push(payloadText);
+              payloadByIndex[inputIndex] = payloadText;
 
               const grouped = parseWorkflowPayloadGroups(payloadText, batchIds);
               const normalized = grouped.length > 0
                 ? grouped
                 : [
                     {
-                      id: `link-${allGroups.length + 1}`,
+                      id: `link-${inputIndex + 1}`,
                       shareLink: batchIds[0] || "",
                       result: parseWorkflowPayload(payloadText),
                     },
                   ];
 
               allGroups.push(...normalized);
+              // Done 但三类产物全空 = 这条其实没生成成功。先记下来，等流自然结束后
+              // 按失败处理：否则 `orderWorkflowGroupsByLinks` 会把它丢掉，effect 又认为
+              // 「还缺结果」，可能反复自动重跑同一条（真实花钱）。
+              emptyPayload = !normalized.some(item => hasWorkflowResult(item));
+              if (!emptyPayload) {
+                // 这条一出结果就立刻合并进界面（不必等其余并发中的选题）。
+                commitPartialResults();
+              }
             }
           }
         }
 
         if (!seenDone) {
-          throw new Error(`工作流连接已结束，但未收到 Done 事件（批次 ${batchIndex + 1}/${batches.length}）。可能是请求超时或中途被中断，请重试。`);
+          throw new Error(`「${getWorkflowInputTitle(input, benchmarkVideos)}」的生成连接已结束，但没收到 Done 事件（可能请求超时或中途被中断），请重试。`);
         }
+        if (emptyPayload) {
+          throw new Error(`「${getWorkflowInputTitle(input, benchmarkVideos)}」已返回，但标题 / 钩子 / 文案都为空，请重试。`);
+        }
+      };
 
-        commitPartialResults();
+      // 有界并发：每条选题内部已经是 4 个 Agent 并行，这里只控制「同时跑几条选题」。
+      await mapWithConcurrency(inputsToGenerate, CONTENT_TOPIC_CONCURRENCY, async (input, inputIndex) => {
+        if (fatalError) return;
+        try {
+          await runOneTopic(input, inputIndex);
+          finishedCount += 1;
+          setWorkflowProgress({ done: finishedCount, failed: failedCount, total: inputsToGenerate.length });
+        } catch (error) {
+          // 整轮被替换（用户又点了一次）/ 被取消：不记成「这条失败」，交给外层统一处理。
+          if (!isCurrentRun() || controller.signal.aborted) throw error;
+
+          // 单条看门狗触发的超时（整轮 controller 没被 abort）：只失败这一条。
+          const isTopicTimeout = error instanceof DOMException
+            && (error.name === "TimeoutError" || error.name === "AbortError");
+          const message = isTopicTimeout
+            ? `单条生成超时（超过 ${Math.round(CONTENT_TOPIC_TIMEOUT_MS / 60000)} 分钟），已跳过该条`
+            : error instanceof Error ? error.message : "工作流执行失败";
+          failures.push({ id: input.id, title: getWorkflowInputTitle(input, benchmarkVideos), message });
+          failedCount += 1;
+          setWorkflowProgress({ done: finishedCount, failed: failedCount, total: inputsToGenerate.length });
+          setWorkflowFailures([...failures]);
+
+          if (isFatalWorkflowError(error)) {
+            // 登录失效 / 凭证缺失：剩下还在跑的请求注定一起失败，立即停掉。
+            fatalError = error instanceof Error ? error : new Error(message);
+            controller.abort();
+          }
+          throw error;
+        }
+      });
+
+      if (!isCurrentRun()) {
+        return;
+      }
+      if (controller.signal.aborted) {
+        if (fatalError) throw fatalError;
+        throw new DOMException("工作流任务已取消", "AbortError");
       }
 
       commitPartialResults();
+
+      if (failures.length > 0) {
+        const names = failures.slice(0, 3).map(item => `「${item.title}」`).join("、");
+        setWorkflowError(
+          `本轮已生成 ${finishedCount}/${inputsToGenerate.length} 条，${failures.length} 条失败：${names}${failures.length > 3 ? " 等" : ""}。成功的结果已保留，可点「补跑未生成」只补跑缺的。`,
+        );
+      }
     } catch (error) {
       if (!isCurrentRun()) {
         return;
@@ -1815,7 +2508,11 @@ export default function ContentPage() {
         return;
       }
 
-      const message = error instanceof Error ? error.message : "工作流执行失败";
+      // 401/403 时服务端返回的是 JSON 原文，直接显示给用户没有意义。
+      const status = Number((error as any)?.status || 0);
+      const message = status === 401 || status === 403
+        ? "登录已失效，请重新登录后再补跑未生成的选题。"
+        : error instanceof Error ? error.message : "工作流执行失败";
       setWorkflowError(message);
     } finally {
       if (isCurrentRun()) {
@@ -1827,16 +2524,26 @@ export default function ContentPage() {
   };
 
   useEffect(() => {
+    safeSessionSet("contentWorkflowFailures", JSON.stringify(workflowFailures));
+  }, [workflowFailures]);
+
+  useEffect(() => {
+    safeSessionSet("contentWorkflowFallbackNotes", JSON.stringify(workflowFallbackNotes));
+  }, [workflowFallbackNotes]);
+
+  useEffect(() => {
     const autoRunKey = sessionStorage.getItem("contentAutoRunKey") || "";
     const consumedKey = sessionStorage.getItem("contentAutoRunConsumedKey") || "";
     if (workflowInputs.length === 0 || workflowInFlightRef.current) return;
-    const reusableGroups = pickReusableWorkflowGroups(workflowInputIds, workflowGroups);
-    const hasMissingLinks = workflowInputIds.some(id => !reusableGroups.some(group => sameLink(group.shareLink, id)));
-    if (autoRunKey && consumedKey === autoRunKey && !hasMissingLinks) return;
-    if (!autoRunKey || (autoRunKeyRef.current === autoRunKey && !hasMissingLinks)) return;
+    // 这个 key 已经自动跑过（包含「上一次跑完但有失败」的情况）：**不再自动重跑**。
+    // 失败 / 缺结果交给界面上的「补跑未生成（N）」按钮显式触发。
+    // 否则刷新一次、返回一次就会悄悄再烧一遍模型调用（永久失败的链接会无限重试）。
+    if (autoRunKey && consumedKey === autoRunKey) return;
+    // 同一次挂载内也只自动跑一次。
+    if (!autoRunKey || autoRunKeyRef.current === autoRunKey) return;
 
     autoRunKeyRef.current = autoRunKey;
-    sessionStorage.setItem("contentAutoRunConsumedKey", autoRunKey);
+    safeSessionSet("contentAutoRunConsumedKey", autoRunKey);
     runWorkflow({ force: false });
   }, [workflowInputs, workflowInputIds, workflowGroups]);
 
@@ -1870,8 +2577,8 @@ export default function ContentPage() {
       </header>
 
       <div className="mx-auto max-w-[1500px] px-5 py-6 sm:px-8 lg:px-10 lg:py-8">
-        <div className="grid grid-cols-1 xl:grid-cols-[320px_1fr] gap-6">
-          <div className="space-y-4">
+        <div className="grid min-w-0 grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] gap-6">
+          <div className="min-w-0 space-y-4 break-words">
             <Accordion type="multiple" defaultValue={["context-1", "context-2"]} className="space-y-3">
               <AccordionItem value="context-1" className="border border-slate-200 rounded-xl bg-white">
                 <AccordionTrigger className="px-4 py-3 text-sm font-semibold text-slate-800">
@@ -1919,11 +2626,34 @@ export default function ContentPage() {
             </Accordion>
           </div>
 
-          <div className="space-y-6">
+          <div className="min-w-0 space-y-6">
             <div className="rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-600 space-y-3">
               <div>
                 当前已选选题：{selectedTopics.length} 条。后续标题、3 秒留存、二创文案将基于这些真实选题数据生成。
               </div>
+              {selectedTopics.length > CONTENT_TOPIC_CONCURRENCY && (
+                <div className="text-xs text-slate-500">
+                  共 {selectedTopics.length} 条：按每次 {CONTENT_TOPIC_CONCURRENCY} 条并发生成（单条内部 4 个 Agent 已经并行），
+                  完成一条就先展示一条，不必等整批跑完。
+                </div>
+              )}
+              {missingScriptCount > 0 && (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                  其中 {missingScriptCount} 条没有可复用的口播脚本（时间窗口 &gt;7 天 / 选题页还在提取 / 该条没提到）。
+                  这些会先现场解析 + 转写再生成，单条约多 1~2 分钟，是整批时间的主要来源。
+                </div>
+              )}
+              {unusableTopics.length > 0 && (
+                <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                  另有 {unusableTopics.length} 条选题没有可用链接，无法进入生成（也不会出现在「补跑未生成」里）。
+                  请回选题页重新获取该账号作品后再选。
+                </div>
+              )}
+              {duplicateLinkCount > 0 && (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                  有 {duplicateLinkCount} 条选题链接重复：它们会共用同一份生成结果，卡片总数会比勾选数少 {duplicateLinkCount} 条。
+                </div>
+              )}
               {wechatTopics.length > 0 && (
                 <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
                   已包含 {wechatTopics.length} 条视频号选题。系统将使用媒体地址和 decode_key 解密后进入转写生成。
@@ -1941,10 +2671,72 @@ export default function ContentPage() {
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                       生成中...
                     </>
-                  ) : workflowGroups.length > 0 ? "重新生成" : "重新生成内容"}
+                  ) : workflowGroups.length > 0 ? `重新生成全部（${workflowInputIds.length} 条）` : "重新生成内容"}
                 </Button>
+                {workflowLoading && workflowProgress && (
+                  <span className="text-xs text-slate-500">
+                    本轮已完成 {workflowProgress.done}/{workflowProgress.total} 条
+                    {workflowProgress.failed > 0 ? `，失败 ${workflowProgress.failed} 条` : ""}
+                    （并发 {CONTENT_TOPIC_CONCURRENCY}）
+                  </span>
+                )}
+                {!workflowLoading
+                  && missingGroupCount > 0
+                  && hasRunEvidence && (
+                  // `force: false` 只补跑缺结果的选题：已成功的由 pickReusableWorkflowGroups 复用，
+                  // 不会为了几条失败把整批模型调用重付一遍。
+                  // 条数以「输入 - 已有结果」为准 —— 致命错误中止后，后面没跑的条目不进失败列表。
+                  <Button
+                    variant="outline"
+                    className="h-9 rounded-xl border-slate-200 bg-white text-slate-700"
+                    onClick={() => runWorkflow({ force: false })}
+                  >
+                    补跑未生成（{missingGroupCount}）
+                  </Button>
+                )}
                 {workflowError && <span className="text-xs text-red-600">{workflowError}</span>}
               </div>
+
+              {!workflowLoading && missingGroupCount > 0 && hasRunEvidence && (
+                // 用「输入 vs 已有结果」算出来的未生成清单，而不是只用内存里的失败列表：
+                // 刷新后失败列表还在（sessionStorage），但即使它丢了，这里也能逐条列出
+                // 是哪几条没生成、已成功的几条不会重跑 —— 这正是「48 成功 / 2 失败」场景。
+                <details className="rounded-lg border border-rose-200 bg-rose-50 p-3" open>
+                  <summary className="cursor-pointer text-xs font-semibold text-rose-700">
+                    还有 {missingGroupCount} 条未生成（已成功的 {matchedWorkflowGroups.length} 条不会重跑）
+                  </summary>
+                  <ul className="mt-2 space-y-1 text-[11px] text-rose-700">
+                    {missingInputs.map(input => {
+                      const failure = visibleWorkflowFailures.find(item => item.id === input.id);
+                      return (
+                        <li key={input.id}>
+                          「{getWorkflowInputTitle(input, benchmarkVideos)}」：
+                          {failure ? failure.message : "上次生成未完成（中断，或还在队列里没轮到）"}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  <p className="mt-2 text-[11px] text-rose-600">
+                    点上方「补跑未生成（{missingGroupCount}）」只重跑这些；已成功的 {matchedWorkflowGroups.length} 条结果会保留，不会重复花模型调用。
+                  </p>
+                </details>
+              )}
+
+              {!workflowLoading && visibleFallbackNotes.length > 0 && (
+                <details className="rounded-lg border border-amber-200 bg-amber-50 p-3" open>
+                  <summary className="cursor-pointer text-xs font-semibold text-amber-700">
+                    {visibleFallbackNotes.length} 条使用了兜底结果，建议重点检查
+                  </summary>
+                  <ul className="mt-2 space-y-1 text-[11px] text-amber-700">
+                    {visibleFallbackNotes.map(item => (
+                      <li key={item.id}>「{item.title}」：{item.count} 个 Agent 未拿到模型结果（可能是限流/超时），已用规则兜底。</li>
+                    ))}
+                  </ul>
+                  <p className="mt-2 text-[11px] text-amber-700">
+                    这些条目的标题/文案可能是模板或原脚本兜底出来的。确认不放心时，可用上方「重新生成全部」重做整批（会重新消耗模型调用）。
+                  </p>
+                </details>
+              )}
 
               {streamPreview && (
                 <details className="rounded-lg border border-slate-200 bg-slate-50 p-3">
@@ -1972,10 +2764,11 @@ export default function ContentPage() {
                       value={`topic-${topic?.id || index}`}
                       className="border border-slate-200 rounded-lg bg-slate-50"
                     >
-                      <AccordionTrigger className="px-3 py-2 text-xs text-slate-700">
-                        <span className="text-slate-900 font-medium">{topic?.title || "未命名选题"}</span>
+                      <AccordionTrigger className="min-w-0 px-3 py-2 text-xs text-slate-700">
+                        <span className="min-w-0 flex-1 truncate text-left text-slate-900 font-medium" title={topic?.title || "未命名选题"}>{compactTopicLabel(topic?.title || "未命名选题")}</span>
                       </AccordionTrigger>
                       <AccordionContent className="px-3 pb-3 text-xs text-slate-600 space-y-2">
+                        <div className="max-h-32 overflow-auto whitespace-pre-wrap break-words">完整标题：{topic?.title || "未命名选题"}</div>
                         <div>作者：{topic?.authorName || "未知"}</div>
                         <div>{isWeChatChannelsTopic(topic) ? "视频号来源" : "链接"}：{describeTopicSource(topic) || "未提供"}</div>
                         <div>
@@ -2000,6 +2793,11 @@ export default function ContentPage() {
                     <span className="ml-1 font-semibold text-slate-900">
                       {workflowGroups.length > 0 ? `${activeGroupIndex + 1} / ${workflowGroups.length}` : "0 / 0"}
                     </span>
+                    {savedDraftForCurrentGroup && (
+                      <span className="ml-2 rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-600">
+                        已保存
+                      </span>
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
                     <Button
@@ -2400,15 +3198,167 @@ export default function ContentPage() {
               </Card>
             </div>
 
+            {/* ── 保存记录与导出（不经过发布仓也能导出飞书）──────────────── */}
+            <Card className="bg-white border-slate-200">
+              <CardHeader className="pb-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <CardTitle className="text-base font-semibold text-slate-900">保存记录与导出</CardTitle>
+                  <span className="text-xs text-slate-500">
+                    本批已保存 {savedDraftsForCurrentInputs.length} 条 · 待导出 {pendingDraftCount} 条
+                  </span>
+                </div>
+              </CardHeader>
+              <CardContent className="space-y-3 text-sm text-slate-700">
+                <p className="text-xs leading-5 text-slate-500">
+                  保存记录在服务端持久化，切题/刷新/重新进入都还在；只做选题二创时，不必经过发布仓也能从这里导出飞书。
+                  导出**不会自动清空**记录，需要时用「清空保存记录」。
+                </p>
+                {savedDraftsError && (
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                    读取已保存记录失败：{savedDraftsError}。仍可点「保存本条文案」重试。
+                  </div>
+                )}
+                {savedDraftsForCurrentInputs.length === 0 ? (
+                  <div className="rounded-lg border border-dashed border-slate-300 px-3 py-4 text-xs text-slate-500">
+                    还没有保存记录。在上方勾选标题 / 3 秒留存 / 结尾钩子 / 二创文案，再点底部的「保存本条文案」。
+                  </div>
+                ) : (
+                  <ul className="max-h-56 space-y-1.5 overflow-auto pr-1">
+                    {savedDraftsForCurrentInputs.map(draft => {
+                      const isActive = savedDraftForCurrentGroup?.id === draft.id;
+                      return (
+                        <li
+                          key={draft.id}
+                          className={`flex items-center gap-2 rounded-lg border px-2.5 py-2 text-xs ${
+                            isActive ? "border-blue-200 bg-blue-50" : "border-slate-200 bg-slate-50"
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            className="min-w-0 flex-1 text-left"
+                            onClick={() => jumpToSavedDraft(draft)}
+                            title="点击定位到这条选题"
+                          >
+                            <div className="text-[11px] text-slate-400">
+                              保存于 {new Date(draft.updatedAt || draft.createdAt).toLocaleString("zh-CN", { hour12: false })}
+                            </div>
+                          </button>
+                          <button
+                            type="button"
+                            className="shrink-0 rounded px-2 py-1 text-[11px] text-rose-600 hover:bg-rose-50"
+                            onClick={() => setDeleteDraftTarget(draft)}
+                          >
+                            删除
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    className="h-9 rounded-xl bg-blue-600 text-white hover:bg-blue-700"
+                    disabled={editorLoading || saveDraftLoading || batchExportLoading || !activeGroup}
+                    onClick={goToFinalEditor}
+                  >
+                    {editorLoading ? "读取文案中…" : "最终文案编辑页"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="h-9 rounded-xl border-slate-200"
+                    disabled={batchExportLoading || savedDraftsForCurrentInputs.length === 0}
+                    onClick={() => exportAllPendingDrafts("feishu")}
+                  >
+                    写入飞书文档
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="h-9 rounded-xl border-slate-200"
+                    disabled={batchExportLoading || savedDraftsForCurrentInputs.length === 0}
+                    onClick={() => exportAllPendingDrafts("bitable")}
+                  >
+                    写入多维表格
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    className="h-9 rounded-xl text-rose-600 hover:bg-rose-50"
+                    disabled={batchExportLoading || pendingDraftCount === 0}
+                    onClick={() => setClearDraftsOpen(true)}
+                  >
+                    清空保存记录
+                  </Button>
+                </div>
+                {batchExportMessage && <div className="text-xs text-slate-600">{batchExportMessage}</div>}
+
+                <div className="rounded-xl border border-slate-200 px-3 py-2.5">
+                  <div className="text-xs font-semibold text-slate-700">飞书多维表格（导出前先绑定）</div>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <input
+                      value={bitableNewName}
+                      onChange={event => setBitableNewName(event.target.value)}
+                      placeholder="新表格名称（可选）"
+                      className="h-9 min-w-[160px] flex-1 rounded-lg border border-slate-200 px-3 text-xs outline-none focus:border-blue-300"
+                    />
+                    <Button
+                      variant="outline"
+                      className="h-9 rounded-lg px-3 text-xs"
+                      disabled={bitableCreateLoading}
+                      onClick={bindNewBitable}
+                    >
+                      {bitableCreateLoading ? "创建中…" : "新建表格"}
+                    </Button>
+                  </div>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <input
+                      value={bitableTargetUrl}
+                      onChange={event => setBitableTargetUrl(event.target.value)}
+                      placeholder="粘贴已有表格 URL"
+                      className="h-9 min-w-[200px] flex-1 rounded-lg border border-slate-200 px-3 text-xs outline-none focus:border-blue-300"
+                    />
+                    <Button variant="outline" className="h-9 rounded-lg px-3 text-xs" onClick={bindExistingBitable}>
+                      绑定
+                    </Button>
+                    <span className={`text-[11px] ${cachedBitableBinding.appToken ? "text-emerald-600" : "text-slate-400"}`}>
+                      {cachedBitableBinding.appToken ? "已绑定" : "未绑定"}
+                    </span>
+                  </div>
+                  {bitableBindingError && <div className="mt-1 text-[11px] text-rose-600">{bitableBindingError}</div>}
+                </div>
+              </CardContent>
+            </Card>
+
           </div>
         </div>
       </div>
 
       <div className="border-t border-slate-200/80 bg-white/90 px-5 py-4 backdrop-blur sm:px-8 lg:px-10">
-        <div className="mx-auto flex max-w-[1500px] justify-end">
-          <Button className="h-10 rounded-xl bg-blue-600 px-6 text-sm font-semibold text-white shadow-sm hover:bg-blue-700" onClick={goToPublishWarehouse}>
-            下一步：进入发布仓
-          </Button>
+        <div className="mx-auto flex max-w-[1500px] flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0 max-w-full text-xs text-slate-500 break-words" role="status">
+            {saveDraftMessage
+              || (savedDraftForCurrentGroup
+                ? `本条已保存：${new Date(savedDraftForCurrentGroup.updatedAt || savedDraftForCurrentGroup.createdAt).toLocaleString("zh-CN", { hour12: false })}`
+                : (savedDraftsForCurrentInputs.length > 0 ? `本批已保存 ${savedDraftsForCurrentInputs.length} 条` : "当前选题未保存"))}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="outline" className="h-10 rounded-xl" onClick={() => exportAllPendingDrafts("feishu", true)} disabled={batchExportLoading || saveDraftLoading || !activeGroup || !hasCurrentSelection()}>
+              导出本条二创到飞书
+            </Button>
+            <Button variant="outline" className="h-10 rounded-xl" onClick={() => exportAllPendingDrafts("bitable", true)} disabled={batchExportLoading || saveDraftLoading || !activeGroup || !hasCurrentSelection()}>
+              导出本条二创到多维表格
+            </Button>
+            <Button
+              variant="outline"
+              className="h-10 rounded-xl border-slate-200 bg-white text-slate-700"
+              onClick={saveCurrentDraft}
+              disabled={saveDraftLoading || !activeGroup || !hasCurrentSelection()}
+            >
+              {saveDraftLoading ? "保存中…" : savedDraftForCurrentGroup ? "更新本条保存" : "保存本条文案"}
+            </Button>
+            <Button className="h-10 rounded-xl bg-blue-600 px-6 text-sm font-semibold text-white shadow-sm hover:bg-blue-700" onClick={goToPublishWarehouse} disabled={saveDraftLoading || batchExportLoading}>
+              下一步：进入发布仓
+            </Button>
+          </div>
         </div>
       </div>
 
@@ -2492,6 +3442,28 @@ export default function ContentPage() {
           </div>
         </div>
       )}
+      <ConfirmDialog
+        open={clearDraftsOpen}
+        onOpenChange={setClearDraftsOpen}
+        title="清空已保存记录？"
+        description={`将删除当前任务下已保存的 ${savedDraftsForCurrentInputs.length} 条选题文案。导出前请确认已经写入飞书（导出不会自动清空）。`}
+        confirmLabel="清空"
+        loading={clearDraftsLoading}
+        onConfirm={clearSavedDrafts}
+      />
+
+      <ConfirmDialog
+        open={Boolean(deleteDraftTarget)}
+        onOpenChange={open => { if (!open) setDeleteDraftTarget(null); }}
+        title="删除这条保存记录？"
+        description={deleteDraftTarget
+          ? `「${deleteDraftTarget.topic?.title || "未命名选题"}」的保存记录会被删除；已导出的飞书内容不受影响。`
+          : ""}
+        confirmLabel="删除"
+        loading={deleteDraftLoading}
+        onConfirm={deleteSavedDraft}
+      />
+
     </div>
   );
 }

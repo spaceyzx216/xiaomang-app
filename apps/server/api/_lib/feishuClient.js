@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { buildFinalDraftMarkdown, normalizeBenchmarkVideos, publishWarehouseCells } from "./exportFormatters.js";
+import { buildFinalDraftMarkdown, buildFinalDraftMarkdownForItems, normalizeBenchmarkVideos, publishWarehouseCells } from "./exportFormatters.js";
 import { AgentError, fetchJson, retryDelayMs, sleep } from "./contentAgent/http.js";
 
 const FEISHU_BASE_URL = "https://open.feishu.cn";
@@ -317,10 +317,16 @@ export const writeFinalDraftToFeishu = async (draft = {}, options = {}) => {
   const config = options.config || getFeishuConfig();
   ensureFeishuConfigured(config);
 
-  const markdown = buildFinalDraftMarkdown(draft);
+  // 支持两种入参：
+  //   · 单条草稿对象（内容生成页旧调用）；
+  //   · `{ items: [...] }`（发布仓 / 内容页的「全部已保存记录」）。
+  const items = Array.isArray(draft?.items) ? draft.items.filter(Boolean) : [];
+  const markdown = items.length > 0
+    ? buildFinalDraftMarkdownForItems(items)
+    : buildFinalDraftMarkdown(draft);
   const tenantAccessToken = await getTenantAccessToken(config, options);
   const document = await createFeishuDocument(
-    { title: titleFromDraft(draft) },
+    { title: titleFromDraft(items[0] || draft) },
     tenantAccessToken,
     config,
     options,
@@ -743,8 +749,10 @@ export const writeFinalDraftToFeishuBitable = async (draft = {}, options = {}) =
   ensureFeishuConfigured(config);
 
   const tenantAccessToken = await getTenantAccessToken(config, options);
-  const records = finalDraftToBitableRecords(draft);
-  const urlTarget = parseFeishuBitableUrl(draft?.feishuBitable?.targetUrl || draft?.feishuBitableUrl || "");
+  // `{ items: [...] }` = 多条已保存记录（发布仓 / 内容页导出）；否则按单条草稿处理。
+  const sourceItems = Array.isArray(draft?.items) && draft.items.length > 0 ? draft.items.filter(Boolean) : [draft];
+  const records = sourceItems.flatMap(item => finalDraftToBitableRecords(item));
+  const urlTarget = parseFeishuBitableUrl(draft?.feishuBitable?.targetUrl || draft?.targetUrl || draft?.feishuBitableUrl || "");
   const taskInfo = draft?.taskInfo || draft?.task || {};
   const requestedTableName = trimBitableName(
     draft?.feishuBitable?.tableName ||

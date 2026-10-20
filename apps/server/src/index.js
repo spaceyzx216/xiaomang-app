@@ -56,11 +56,15 @@ import {
   MAX_TOPIC_SLICE_PAGES,
   parseRecentDays,
 } from "../api/_lib/topicPagination.js";
+import { buildFinalDraftMarkdown } from "../api/_lib/exportFormatters.js";
 import {
-  buildFinalDraftMarkdown,
-  normalizeBenchmarkVideos,
-  normalizePublishWarehouse,
-} from "../api/_lib/exportFormatters.js";
+  buildDraftItem,
+  clearDraftItems,
+  deleteDraftItem,
+  draftScopeKey,
+  listDraftItems,
+  upsertDraftItems,
+} from "../api/_lib/draftItems.js";
 import {
   createFeishuBitableForTask,
   writeFinalDraftToFeishu,
@@ -2174,40 +2178,16 @@ app.post("/api/agent/workflow/stream-run", async (req, res) => {
 });
 
 app.post("/api/final-drafts", async (req, res) => {
-  const {
-    titleDraft = "",
-    hookDraft = "",
-    endingHookDraft = "",
-    scriptDraft = "",
-    rewriteDraft = "",
-    translationDraft = "",
-    benchmarkVideos = [],
-    publishWarehouse = null,
-  } = req.body || {};
-
+  const user = await requireAuth(req, res);
+  if (!user) return;
   try {
+    const item = buildDraftItem(req.body || {}, user.id);
     const db = await readFinalDrafts();
-    const item = {
-      id: `draft_${Date.now()}`,
-      createdAt: new Date().toISOString(),
-      titleDraft: String(titleDraft || ""),
-      hookDraft: String(hookDraft || ""),
-      endingHookDraft: String(endingHookDraft || ""),
-      scriptDraft: String(scriptDraft || ""),
-      rewriteDraft: String(rewriteDraft || ""),
-      translationDraft: String(translationDraft || ""),
-      benchmarkVideos: normalizeBenchmarkVideos(benchmarkVideos),
-      // 发布仓三块产出。**落库前先归一化**：它会把封面 dataUrl 挡掉、并把各段截到上限，
-      // 否则一张 base64 封面就能把这份 JSON 文件撑到几 MB。
-      publishWarehouse: publishWarehouse && typeof publishWarehouse === "object"
-        ? normalizePublishWarehouse(publishWarehouse)
-        : null,
-    };
-
-    db.items = [item, ...(Array.isArray(db.items) ? db.items : [])].slice(0, 200);
-    await writeFinalDrafts(db);
-
-    return res.json({ success: true, item });
+    const items = upsertDraftItems(Array.isArray(db.items) ? db.items : [], item);
+    await writeFinalDrafts({ items });
+    const scopeKey = draftScopeKey(item);
+    const stored = scopeKey ? items.find(entry => draftScopeKey(entry) === scopeKey) : items[0];
+    return res.json({ success: true, item: stored || item });
   } catch (error) {
     return res.status(500).json({
       success: false,
@@ -2216,10 +2196,16 @@ app.post("/api/final-drafts", async (req, res) => {
   }
 });
 
-app.get("/api/final-drafts", async (_req, res) => {
+app.get("/api/final-drafts", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
   try {
     const db = await readFinalDrafts();
-    return res.json({ success: true, items: Array.isArray(db.items) ? db.items : [] });
+    const items = listDraftItems(db.items, user.id, {
+      customerId: req.query?.customerId,
+      taskId: req.query?.taskId,
+    });
+    return res.json({ success: true, items });
   } catch (error) {
     return res.status(500).json({
       success: false,
@@ -2228,10 +2214,14 @@ app.get("/api/final-drafts", async (_req, res) => {
   }
 });
 
-app.delete("/api/final-drafts", async (_req, res) => {
+app.delete("/api/final-drafts", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
   try {
-    await writeFinalDrafts({ items: [] });
-    return res.json({ success: true, removedAll: true });
+    const db = await readFinalDrafts();
+    const { items, removed } = clearDraftItems(db.items, user.id);
+    await writeFinalDrafts({ items });
+    return res.json({ success: true, removedAll: true, removed });
   } catch (error) {
     return res.status(500).json({
       success: false,
@@ -2241,17 +2231,17 @@ app.delete("/api/final-drafts", async (_req, res) => {
 });
 
 app.delete("/api/final-drafts/:id", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
   const id = String(req.params?.id || "").trim();
   if (!id) {
     return res.status(400).json({ success: false, error: "id is required" });
   }
-
   try {
     const db = await readFinalDrafts();
-    const list = Array.isArray(db.items) ? db.items : [];
-    const next = list.filter((item) => String(item?.id || "") !== id);
-    await writeFinalDrafts({ items: next });
-    return res.json({ success: true, removed: list.length - next.length });
+    const { items, removed } = deleteDraftItem(db.items, user.id, id);
+    await writeFinalDrafts({ items });
+    return res.json({ success: true, removed });
   } catch (error) {
     return res.status(500).json({
       success: false,

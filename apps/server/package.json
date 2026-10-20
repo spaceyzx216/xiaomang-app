@@ -8,6 +8,7 @@
     "test": "node --test tests/*.test.mjs",
     "verify:routes": "node scripts/verify-server-routes.mjs",
     "verify:render": "node scripts/verify-web-render.mjs",
+    "verify:concurrency": "node scripts/verify-content-concurrency.mjs",
     "probe:image": "node scripts/probe-image-gateway.mjs",
     "asr:smoke": "node scripts/asr-stream-smoke.mjs"
   },

@@ -1735,6 +1735,57 @@ try {
     if (id) await fetch(`${BASE}/api/final-drafts/${encodeURIComponent(id)}`, { method: "DELETE", headers: { Cookie: employeeA.cookie } });
   }
 
+  // ★ 2026-10-19：按选题保存 / owner 隔离 / 再保存=更新。
+  //   这是「记录一直保存、不被覆盖、不串用户」的服务端契约。
+  const draftTopic = { id: "__verify_topic_a__", title: "冒烟选题 A", shareLink: "https://v.douyin.com/verify-a", platform: "douyin" };
+  const draftV1 = await empPost("/api/final-drafts", {
+    customerId: "verify-cust-1",
+    taskId: "verify-task-1",
+    topic: draftTopic,
+    titleDraft: "1. 冒烟标题 v1",
+    scriptDraft: "v1 文案",
+    selection: { selectedTitles: ["1. 冒烟标题 v1"], selectedScripts: ["script-1"], rewriteEnabled: true },
+  }, employeeA);
+  check(draftV1.status === 200 && draftV1.json?.item?.topic?.id === draftTopic.id,
+    "★ 按选题保存草稿 → 200 且 topic 元信息落库",
+    JSON.stringify(draftV1.json).slice(0, 200));
+
+  const draftV2 = await empPost("/api/final-drafts", {
+    customerId: "verify-cust-1",
+    taskId: "verify-task-1",
+    topic: draftTopic,
+    titleDraft: "1. 冒烟标题 v2",
+    selection: { selectedTitles: ["1. 冒烟标题 v2"] },
+  }, employeeA);
+  check(draftV2.json?.item?.id === draftV1.json?.item?.id,
+    "★★ 同一选题再保存 = 更新（id 不变，不会出现两条重复记录）",
+    `${draftV1.json?.item?.id} vs ${draftV2.json?.item?.id}`);
+  check(draftV2.json?.item?.titleDraft === "1. 冒烟标题 v2", "  更新后内容是新保存的");
+  check(draftV2.json?.item?.scriptDraft === "v1 文案",
+    "  没带的字段保留旧值（内容页保存不会冲掉旧文案/发布仓字段）");
+  check(draftV2.json?.item?.selection?.selectedTitles?.[0] === "1. 冒烟标题 v2",
+    "  勾选快照跟着更新（前端切回旧选题时靠它还原）");
+
+  const aDrafts = await empGet("/api/final-drafts?customerId=verify-cust-1&taskId=verify-task-1", employeeA);
+  const aTopicDrafts = (aDrafts.json?.items || []).filter(item => item?.topic?.id === draftTopic.id);
+  check(aTopicDrafts.length === 1, "  按客户+任务筛选后同一选题只有一条", `实际 ${aTopicDrafts.length} 条`);
+
+  const bDrafts = await empGet("/api/final-drafts?customerId=verify-cust-1&taskId=verify-task-1", employeeB);
+  check((bDrafts.json?.items || []).every(item => item?.topic?.id !== draftTopic.id),
+    "★★ 员工 B 读不到员工 A 的保存记录（owner 隔离）",
+    `B 看到 ${(bDrafts.json?.items || []).length} 条`);
+
+  await fetch(`${BASE}/api/final-drafts`, { method: "DELETE", headers: { Cookie: employeeB.cookie } });
+  const afterBClear = await empGet("/api/final-drafts?customerId=verify-cust-1&taskId=verify-task-1", employeeA);
+  check((afterBClear.json?.items || []).some(item => item?.topic?.id === draftTopic.id),
+    "  员工 B 清空不会删掉员工 A 的记录");
+
+  await fetch(`${BASE}/api/final-drafts`, { method: "DELETE", headers: { Cookie: employeeA.cookie } });
+  const afterAClear = await empGet("/api/final-drafts", employeeA);
+  check((afterAClear.json?.items || []).length === 0,
+    "  员工 A 清空后列表为空",
+    `剩余 ${(afterAClear.json?.items || []).length} 条`);
+
   // ★ 封面基底与三类定义 —— 3.1 拆成「账号级基底 / 每条出封面」两层靠的就是它们。
   const tiersRes = await empGet("/api/publish-warehouse?resource=cover-tiers", employeeA);
   const tierItems = Array.isArray(tiersRes.json?.items) ? tiersRes.json.items : [];

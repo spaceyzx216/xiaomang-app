@@ -5,7 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Badge } from "./components/ui/badge";
 import { FileText, ArrowLeft } from "lucide-react";
 import { apiUrl, fetchWithRetry, parseApiJson } from "./api";
-import { cacheFinalDraft } from "./finalDraftCache";
+import { cacheFinalDraft, removeCachedFinalDraft } from "./finalDraftCache";
 
 type BenchmarkVideo = {
   title?: string;
@@ -38,6 +38,13 @@ type PublishWarehousePayload = {
 };
 
 type FinalDraftPayload = {
+  publishWarehouse?: PublishWarehousePayload | null;
+  titleDraft?: string;
+  hookDraft?: string;
+  endingHookDraft?: string;
+  scriptDraft?: string;
+  rewriteDraft?: string;
+  translationDraft?: string;
   selectedTitles?: Array<{ title: string; detail?: string; raw?: string }>;
   selectedHooks?: Array<{ id: string; content: string; hookType: string }>;
   selectedScripts?: Array<{ id: string; title: string; content: string }>;
@@ -54,6 +61,15 @@ type FinalDraftPayload = {
   sourceGroupId?: string | null;
   sourceGroupIndex?: number;
   totalGroups?: number;
+  topic?: {
+    id?: string;
+    title?: string;
+    shareLink?: string;
+    platform?: string;
+  } | null;
+  customerId?: string;
+  taskId?: string;
+  selection?: Record<string, unknown> | null;
 };
 
 const loadDraftPayload = (): FinalDraftPayload => {
@@ -87,7 +103,7 @@ export default function FinalEditorPage() {
   const payload = useMemo(() => loadDraftPayload(), []);
   const benchmarkVideos = Array.isArray(payload.benchmarkVideos) ? payload.benchmarkVideos : [];
 
-  const [titleDraft, setTitleDraft] = useState(() => joinNonEmpty(
+  const [titleDraft, setTitleDraft] = useState(() => payload.titleDraft ?? joinNonEmpty(
     (payload.selectedTitles || []).map((item, idx) => `${idx + 1}. ${item.title}${item.detail ? `\n${item.detail}` : ""}`)
   ));
 
@@ -98,37 +114,38 @@ export default function FinalEditorPage() {
    *    导出到飞书时「生成3秒」和「生成结尾钩子」就没法分成两列（用户 2026-09-24 的列清单
    *    要求它们是两列）。所以按 hookType 拆开，各是各的可编辑段落。
    */
-  const [hookDraft, setHookDraft] = useState(() => joinNonEmpty(
+  const [hookDraft, setHookDraft] = useState(() => payload.hookDraft ?? joinNonEmpty(
     (payload.selectedHooks || [])
       .filter(item => (item.hookType || "opening_text") === "opening_text")
       .map((item, idx) => `${idx + 1}. ${item.content}`)
   ));
 
   /** 结尾钩子 = `hookType === "ending_text"` 那批（单独一列，不能和 3 秒混着写）。 */
-  const [endingHookDraft, setEndingHookDraft] = useState(() => joinNonEmpty(
+  const [endingHookDraft, setEndingHookDraft] = useState(() => payload.endingHookDraft ?? joinNonEmpty(
     (payload.selectedHooks || [])
       .filter(item => item.hookType === "ending_text")
       .map((item, idx) => `${idx + 1}. ${item.content}`)
   ));
 
-  const hasEndingHook = (payload.selectedHooks || []).some(item => item.hookType === "ending_text");
+  const hasEndingHook = Boolean(payload.endingHookDraft) || (payload.selectedHooks || []).some(item => item.hookType === "ending_text");
 
-  const [scriptDraft, setScriptDraft] = useState(() => joinNonEmpty(
+  const [scriptDraft, setScriptDraft] = useState(() => payload.scriptDraft ?? joinNonEmpty(
     (payload.selectedScripts || []).map((item, idx) => `【文案 ${idx + 1}】\n${item.content}`)
   ));
 
-  const [rewriteDraft, setRewriteDraft] = useState(() => joinNonEmpty(
+  const [rewriteDraft, setRewriteDraft] = useState(() => payload.rewriteDraft ?? joinNonEmpty(
     (payload.rewriteResults || []).map((item, idx) => `【${idx + 1} | ${item.target}】\n${item.rewritten}`)
   ));
 
-  const [translationDraft, setTranslationDraft] = useState(() => joinNonEmpty(
+  const [translationDraft, setTranslationDraft] = useState(() => payload.translationDraft ?? joinNonEmpty(
     (payload.translationItems || []).map((item, idx) => `【${idx + 1} | ${item.sourceType}】\nZH: ${item.zh}\nEN: ${item.en}`)
   ));
 
   const [saveLoading, setSaveLoading] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const localFallbackId = useMemo(() => `local_${Date.now()}`, []);
 
-  // 发布仓带下来的三块产出（可编辑）。没有经过发布仓时全部为空，页面会如实说明。
+  // 两个入口共用已保存稿及发布仓已选材料；没有发布材料时页面如实说明。
   const publish = payload.publishWarehouse;
   const [publishCoverUrl, setPublishCoverUrl] = useState(() => String(publish?.coverUrl || ""));
   const [publishCopy, setPublishCopy] = useState(() => String(publish?.copy || ""));
@@ -138,8 +155,8 @@ export default function FinalEditorPage() {
     && (publish.coverUrl || publish.coverInline || publish.coverTitle || publish.copy || publish.tags),
   );
 
-  const hasRewriteResult = (payload.rewriteResults || []).length > 0;
-  const hasTranslationResult = (payload.translationItems || []).length > 0;
+  const hasRewriteResult = Boolean(payload.rewriteDraft) || (payload.rewriteResults || []).length > 0;
+  const hasTranslationResult = Boolean(payload.translationDraft) || (payload.translationItems || []).length > 0;
 
   const draftPayload = {
     titleDraft,
@@ -151,8 +168,14 @@ export default function FinalEditorPage() {
     translationDraft: hasTranslationResult ? translationDraft : "",
     benchmarkVideos,
     taskInfo: payload.taskInfo || null,
+    // 身份与勾选快照：服务端按 owner+customer+task+topic upsert，
+    // 「内容页保存过 → 发布仓 → 最终编辑页再保存」才能更新同一条而不是新增重复记录。
+    topic: payload.topic || null,
+    customerId: payload.customerId || "",
+    taskId: payload.taskId || "",
+    selection: payload.selection || null,
     // 发布仓的三块产出跟着草稿一起存 —— 飞书文档/多维表格的导出读的就是这份 saved draft，
-    // 所以只有进到这里，用户挑的封面与勾的文案标签才真的会出现在导出结果里。
+    // 在这里的人工修改与二创共用同一条保存稿；发布仓各块仍可独立导出已选材料。
     publishWarehouse: hasPublishInput ? {
       coverUrl: publishCoverUrl.trim(),
       coverTitle: String(publish?.coverTitle || ""),
@@ -179,6 +202,7 @@ export default function FinalEditorPage() {
       if (data?.item?.id) {
         cacheFinalDraft(data.item);
       }
+      removeCachedFinalDraft(localFallbackId);
       const currentIndex = Number(payload.sourceGroupIndex || 0);
       const totalGroups = Number(payload.totalGroups || 0);
       const nextIndex = totalGroups > 0 ? Math.min(currentIndex + 1, totalGroups - 1) : 0;
@@ -187,17 +211,12 @@ export default function FinalEditorPage() {
       navigate("/content");
     } catch (error) {
       const fallbackItem = {
-        id: `local_${Date.now()}`,
+        id: localFallbackId,
         createdAt: new Date().toISOString(),
         ...draftPayload,
       };
       cacheFinalDraft(fallbackItem);
-      const currentIndex = Number(payload.sourceGroupIndex || 0);
-      const totalGroups = Number(payload.totalGroups || 0);
-      const nextIndex = totalGroups > 0 ? Math.min(currentIndex + 1, totalGroups - 1) : 0;
-      sessionStorage.setItem("contentActiveGroupIndex", String(nextIndex));
-      setSaveMessage("服务端保存失败，已先保存到本地浏览器待导出列表，并返回内容生成页。");
-      navigate("/content");
+      setSaveMessage("服务器保存失败，已保存在当前浏览器。请留在本页重试保存；尚未保存到服务器。");
     } finally {
       setSaveLoading(false);
     }

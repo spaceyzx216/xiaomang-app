@@ -176,9 +176,11 @@ export const publishWarehouseCells = (value) => {
   };
 };
 
-export const formatPublishWarehouseSection = (value) => {
+export const formatPublishWarehouseSection = (value, { omitEmpty = false } = {}) => {
   if (!hasPublishWarehouse(value)) return "未提供";
   const cells = publishWarehouseCells(value);
+  if (omitEmpty) return [["发布封面", cells.cover], ["发布文案", cells.copy], ["发布标签", cells.tags]]
+    .filter(([, content]) => content).map(([title, content]) => `## ${title}\n${content}`).join("\n\n");
   return [
     "## 发布封面",
     cells.cover || "未提供",
@@ -219,6 +221,12 @@ export const formatBenchmarkSection = (videos) => {
 
 export const buildFinalDraftMarkdown = (draft = {}, options = {}) => {
   const heading = options.heading || "最终文案";
+  // 分块载荷没有二创字段；仅输出当前发布块，避免导出一页空标题。
+  const hasContentFields = ["titleDraft", "hookDraft", "endingHookDraft", "scriptDraft", "rewriteDraft", "translationDraft"]
+    .some(key => Object.prototype.hasOwnProperty.call(draft, key));
+  if (!hasContentFields && hasPublishWarehouse(draft.publishWarehouse)) {
+    return [`# ${heading}`, "", formatPublishWarehouseSection(draft.publishWarehouse, { omitEmpty: true }), ""].join("\n");
+  }
   // 发布仓的三块产出只在真的带了的时候才追加这一段：
   // 从内容生成页直接来最终编辑页（没经过发布仓）的草稿导出的文档与以前完全一致。
   const publishSection = hasPublishWarehouse(draft.publishWarehouse)
@@ -250,6 +258,22 @@ export const buildFinalDraftMarkdown = (draft = {}, options = {}) => {
     ...publishSection,
     "",
   ].join("\n");
+};
+
+/**
+ * 多条已保存草稿合并成**一篇**飞书文档（每条一个「选题 N」标题）。
+ *
+ * 为什么放在服务端：前端把 items 发过来只是列表，导出侧要能一条条渲染；
+ * 之前 PublishWarehouse 就发 `{ items }`，但服务端只认单条草稿，导出的文档是空的。
+ * 现在单条接口与列表接口共用同一套 format 函数，两边不会再漂移。
+ */
+export const buildFinalDraftMarkdownForItems = (items = []) => {
+  const list = Array.isArray(items) ? items.filter(Boolean) : [];
+  if (list.length === 0) return buildFinalDraftMarkdown({});
+  if (list.length === 1) return buildFinalDraftMarkdown(list[0]);
+  return list
+    .map((item, index) => buildFinalDraftMarkdown(item, { heading: `选题 ${index + 1}` }))
+    .join("\n\n---\n\n");
 };
 
 export const csvEscape = (value) => `"${String(value || "").replace(/"/g, '""')}"`;
